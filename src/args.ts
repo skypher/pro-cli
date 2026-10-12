@@ -21,6 +21,8 @@ const BOOLEAN_FLAGS = new Set([
   "allow-fifty",
   "no-launch",
   "no-backup",
+  "force",
+  "legacy",
 ]);
 
 export function parseArgs(argv: string[]): ParsedArgs {

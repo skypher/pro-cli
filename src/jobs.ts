@@ -55,6 +55,24 @@ export interface ResearchTaskRecord extends ResearchTaskInput {
   updatedAt: string;
 }
 
+export interface ClaimOptions {
+  /** Recorded in jobs.claimed_by so other daemons can tell whose running job this is. */
+  owner?: string;
+  /** Job ids already executing in this daemon; never handed out twice. */
+  exclude?: ReadonlySet<string>;
+  /** Fence resumed research tasks with next_poll_at = now + leaseMs so other daemons skip them. */
+  leaseMs?: number;
+  /** A live legacy daemon owns research tasks whose next_poll_at is NULL (its in-flight marker). */
+  legacyAlive?: boolean;
+}
+
+export interface RunningClaim {
+  id: string;
+  claimedBy: string | null;
+  hasResearchTask: boolean;
+  nextPollAt: string | null;
+}
+
 interface JobRow {
   id: string;
   status: JobStatus;
@@ -86,6 +104,8 @@ export class JobStore {
   static async open(path: string): Promise<JobStore> {
     await ensurePrivateDir(dirname(path));
     const db = new Database(path, { create: true });
+    // Daemons and CLI processes share this file; wait out short write locks instead of failing.
+    db.run("PRAGMA busy_timeout = 5000");
     db.run("PRAGMA journal_mode = WAL");
     db.run("PRAGMA foreign_keys = ON");
     db.run(`
@@ -129,6 +149,7 @@ export class JobStore {
       CREATE INDEX IF NOT EXISTS research_tasks_next_poll_idx
       ON research_tasks(next_poll_at)
     `);
+    addColumnIfMissing(db, "jobs", "claimed_by", "TEXT");
     return new JobStore(db);
   }
 
@@ -208,38 +229,96 @@ export class JobStore {
     return this.get(id);
   }
 
-  claimQueued(id: string): JobRecord | null {
+  claimQueued(id: string, owner?: string): JobRecord | null {
     const now = new Date().toISOString();
     const result = this.db
-      .query("UPDATE jobs SET status = ?, updated_at = ? WHERE id = ? AND status = ?")
-      .run("running", now, id, "queued") as { changes?: number };
+      .query("UPDATE jobs SET status = ?, claimed_by = ?, updated_at = ? WHERE id = ? AND status = ?")
+      .run("running", owner ?? null, now, id, "queued") as { changes?: number };
     return result.changes && result.changes > 0 ? this.get(id) : null;
   }
 
-  claimNextQueued(): JobRecord | null {
+  claimNextQueued(owner?: string): JobRecord | null {
+    const now = new Date().toISOString();
     const row = this.db
-      .query("SELECT id FROM jobs WHERE status = ? ORDER BY created_at ASC LIMIT 1")
-      .get("queued") as { id: string } | null;
-    return row ? this.claimQueued(row.id) : null;
+      .query(
+        `UPDATE jobs SET status = ?, claimed_by = ?, updated_at = ?
+         WHERE id = (SELECT id FROM jobs WHERE status = ? ORDER BY created_at ASC LIMIT 1) AND status = ?
+         RETURNING id`,
+      )
+      .get("running", owner ?? null, now, "queued", "queued") as { id: string } | null;
+    return row ? this.get(row.id) : null;
   }
 
-  claimNextRunnable(): JobRecord | null {
-    const queued = this.claimNextQueued();
+  claimNextRunnable(options: ClaimOptions = {}): JobRecord | null {
+    const queued = this.claimNextQueued(options.owner);
     if (queued) return queued;
 
-    const now = new Date().toISOString();
-    const resumable = this.db
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const nullIsFree = options.legacyAlive ? 0 : 1;
+    const candidates = this.db
       .query(
         `SELECT jobs.id
          FROM jobs
          INNER JOIN research_tasks ON research_tasks.job_id = jobs.id
          WHERE jobs.status = ?
-           AND (research_tasks.next_poll_at IS NULL OR research_tasks.next_poll_at <= ?)
+           AND (research_tasks.next_poll_at <= ? OR (research_tasks.next_poll_at IS NULL AND ? = 1))
          ORDER BY COALESCE(research_tasks.next_poll_at, jobs.updated_at) ASC, jobs.created_at ASC
-         LIMIT 1`,
+         LIMIT 50`,
       )
-      .get("running", now) as { id: string } | null;
-    return resumable ? this.get(resumable.id) : null;
+      .all("running", nowIso, nullIsFree) as Array<{ id: string }>;
+    for (const candidate of candidates) {
+      if (options.exclude?.has(candidate.id)) continue;
+      if (options.leaseMs === undefined) return this.get(candidate.id);
+      const leaseUntil = new Date(now.getTime() + options.leaseMs).toISOString();
+      const leased = this.db
+        .query(
+          `UPDATE research_tasks SET next_poll_at = ?, updated_at = ?
+           WHERE job_id = ? AND (next_poll_at <= ? OR (next_poll_at IS NULL AND ? = 1))`,
+        )
+        .run(leaseUntil, nowIso, candidate.id, nowIso, nullIsFree) as { changes?: number };
+      if (!leased.changes) continue;
+      this.db.query("UPDATE jobs SET claimed_by = ? WHERE id = ?").run(options.owner ?? null, candidate.id);
+      return this.get(candidate.id);
+    }
+    return null;
+  }
+
+  /** Extend the research-task fence for jobs this daemon is still executing. */
+  renewResearchLeases(jobIds: Iterable<string>, leaseUntil: string): void {
+    const renew = this.db.query("UPDATE research_tasks SET next_poll_at = ? WHERE job_id = ?");
+    for (const id of jobIds) renew.run(leaseUntil, id);
+  }
+
+  runningClaims(): RunningClaim[] {
+    const rows = this.db
+      .query(
+        `SELECT jobs.id AS id, jobs.claimed_by AS claimed_by,
+                research_tasks.job_id IS NOT NULL AS has_task, research_tasks.next_poll_at AS next_poll_at
+         FROM jobs LEFT JOIN research_tasks ON research_tasks.job_id = jobs.id
+         WHERE jobs.status = ?`,
+      )
+      .all("running") as Array<{ id: string; claimed_by: string | null; has_task: number; next_poll_at: string | null }>;
+    return rows.map((row) => ({
+      id: row.id,
+      claimedBy: row.claimed_by,
+      hasResearchTask: row.has_task === 1,
+      nextPollAt: row.next_poll_at,
+    }));
+  }
+
+  /** Hand a running job back to the queue after the daemon running it exited mid-run. */
+  requeueRunning(id: string): boolean {
+    const now = new Date().toISOString();
+    const result = this.db
+      .query("UPDATE jobs SET status = ?, claimed_by = NULL, updated_at = ? WHERE id = ? AND status = ?")
+      .run("queued", now, id, "running") as { changes?: number };
+    return Boolean(result.changes);
+  }
+
+  countQueued(): number {
+    const row = this.db.query("SELECT COUNT(*) AS n FROM jobs WHERE status = ?").get("queued") as { n: number };
+    return row.n;
   }
 
   markSucceeded(id: string, result: string): JobRecord {
@@ -300,7 +379,7 @@ export class JobStore {
     }));
   }
 
-  upsertResearchTask(jobId: string, task: ResearchTaskInput): ResearchTaskRecord {
+  upsertResearchTask(jobId: string, task: ResearchTaskInput, leaseUntil: string | null = null): ResearchTaskRecord {
     const now = new Date().toISOString();
     this.db
       .query(
@@ -313,7 +392,7 @@ export class JobStore {
           conversation_id = excluded.conversation_id,
           status = excluded.status,
           last_error_json = NULL,
-          next_poll_at = NULL,
+          next_poll_at = excluded.next_poll_at,
           updated_at = excluded.updated_at`,
       )
       .run(
@@ -323,7 +402,7 @@ export class JobStore {
         task.conversationId ?? null,
         "running",
         null,
-        null,
+        leaseUntil,
         now,
         now,
       );
@@ -337,15 +416,15 @@ export class JobStore {
     return row ? rowToResearchTask(row) : null;
   }
 
-  updateResearchTaskStatus(jobId: string, status: string): ResearchTaskRecord | null {
+  updateResearchTaskStatus(jobId: string, status: string, leaseUntil: string | null = null): ResearchTaskRecord | null {
     const now = new Date().toISOString();
     this.db
       .query(
         `UPDATE research_tasks
-         SET status = ?, last_error_json = NULL, next_poll_at = NULL, updated_at = ?
+         SET status = ?, last_error_json = NULL, next_poll_at = ?, updated_at = ?
          WHERE job_id = ?`,
       )
-      .run(status, now, jobId);
+      .run(status, leaseUntil, now, jobId);
     return this.getResearchTask(jobId);
   }
 
@@ -412,6 +491,17 @@ export function redactJob(
     ...(job.result !== null ? { resultPreview: compact(job.result, 240) } : {}),
     hasResult: job.result !== null,
   };
+}
+
+function addColumnIfMissing(db: Database, table: string, column: string, type: string): void {
+  const columns = db.query(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (columns.some((entry) => entry.name === column)) return;
+  try {
+    db.run(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  } catch (error) {
+    // Another process may have migrated between the check and the ALTER.
+    if (!String(error).includes("duplicate column")) throw error;
+  }
 }
 
 function rowToJob(row: JobRow): JobRecord {

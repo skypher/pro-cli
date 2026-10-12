@@ -9,6 +9,8 @@ export interface ProConfig {
   sessionTokenPath?: string;
   defaultModel?: string;
   defaultReasoning?: string;
+  /** Jobs the daemon runs at once; read when the daemon starts. */
+  daemonConcurrency?: number;
 }
 
 export interface RuntimePaths {

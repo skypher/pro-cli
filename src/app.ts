@@ -21,10 +21,13 @@ import {
   listConversations,
 } from "./conversations";
 import {
+  DEFAULT_DAEMON_CONCURRENCY,
+  MAX_DAEMON_CONCURRENCY,
   ensureDaemonRunning,
   getDaemonStatus,
   runDaemonServer,
   stopDaemon,
+  stopLegacyDaemon,
   type DaemonClient,
 } from "./daemon";
 import { DEFAULT_MODEL, DEFAULT_REASONING, REASONING_LEVELS, isReasoningLevel } from "./defaults";
@@ -492,6 +495,9 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
             port: parseOptionalIntegerFlag(parsed.flags, "port", 0, 65_535),
             pollMs: parseIntegerFlag(parsed.flags, "poll-ms", 500, 25, 60_000),
             idleTimeoutMs: parseOptionalIntegerFlag(parsed.flags, "idle-timeout", 1, 24 * 60 * 60_000),
+            concurrency:
+              parseOptionalIntegerFlag(parsed.flags, "concurrency", 1, MAX_DAEMON_CONCURRENCY) ??
+              configuredConcurrency(config.daemonConcurrency),
           });
           return EXIT.success;
         }
@@ -506,7 +512,17 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
           return EXIT.success;
         }
         if (subcommand === "stop") {
-          writeSuccess(io, mode, { daemon: await stopDaemon(paths) });
+          const force = flagBoolean(parsed.flags, "force");
+          if (flagBoolean(parsed.flags, "legacy")) {
+            const legacy = await stopLegacyDaemon(paths, {
+              force,
+              timeoutMs: parseIntegerFlag(parsed.flags, "wait-timeout", 0, 0, 24 * 60 * 60_000),
+              pollMs: parseIntegerFlag(parsed.flags, "poll-ms", 500, 25, 60_000),
+            });
+            writeSuccess(io, mode, { legacy, daemon: await getDaemonStatus(paths) });
+            return EXIT.success;
+          }
+          writeSuccess(io, mode, { daemon: await stopDaemon(paths, { force }) });
           return EXIT.success;
         }
         throw invalidArgs("Unknown daemon command.", [
@@ -517,7 +533,7 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
         if (subcommand === "get") {
           writeSuccess(io, mode, {
             config,
-            defaults: { model: DEFAULT_MODEL, reasoning: DEFAULT_REASONING },
+            defaults: { model: DEFAULT_MODEL, reasoning: DEFAULT_REASONING, daemonConcurrency: DEFAULT_DAEMON_CONCURRENCY },
             paths: redactPaths(paths),
           });
           return EXIT.success;
@@ -528,7 +544,13 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
           const next = { ...config };
           if (key === "model") next.defaultModel = resolveModel(value);
           else if (key === "reasoning") next.defaultReasoning = resolveReasoning(value);
-          else throw invalidArgs(`Unknown config key ${key}.`, ["Supported keys: model, reasoning."]);
+          else if (key === "daemon-concurrency") {
+            const concurrency = Number(value);
+            if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > MAX_DAEMON_CONCURRENCY) {
+              throw invalidArgs("Invalid daemon-concurrency.", [`Use an integer between 1 and ${MAX_DAEMON_CONCURRENCY}.`]);
+            }
+            next.daemonConcurrency = concurrency;
+          } else throw invalidArgs(`Unknown config key ${key}.`, ["Supported keys: model, reasoning, daemon-concurrency."]);
           await saveConfig(io.env, next);
           writeSuccess(io, mode, { config: next });
           return EXIT.success;
@@ -1294,6 +1316,12 @@ function parseIntegerFlag(
     throw invalidArgs(`Invalid --${source}.`, [`Use an integer between ${min} and ${max}.`]);
   }
   return number;
+}
+
+function configuredConcurrency(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= MAX_DAEMON_CONCURRENCY
+    ? value
+    : undefined;
 }
 
 function parseOptionalIntegerFlag(

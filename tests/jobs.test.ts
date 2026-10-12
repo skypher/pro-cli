@@ -513,3 +513,135 @@ describe("redactJob helper", () => {
 function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+describe("job store: concurrent daemons", () => {
+  test("claimNextQueued records the owner and never hands one job to two connections", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pro-jobs-claim-"));
+    const path = join(dir, "jobs.sqlite");
+    const first = await JobStore.open(path);
+    const second = await JobStore.open(path);
+    try {
+      const ids = new Set<string>();
+      for (let index = 0; index < 6; index += 1) {
+        ids.add(first.create({ prompt: `p${index}`, model: "gpt-5-5-pro", reasoning: "standard", options: {} }).id);
+        await wait(2);
+      }
+      const claimed: string[] = [];
+      for (let round = 0; round < 4; round += 1) {
+        for (const [store, owner] of [[first, "1:a"], [second, "2:b"]] as const) {
+          const job = store.claimNextQueued(owner);
+          if (job) {
+            claimed.push(job.id);
+            expect(job.status).toBe("running");
+          }
+        }
+      }
+      expect(claimed).toHaveLength(6);
+      expect(new Set(claimed)).toEqual(ids);
+      const owners = first.runningClaims().map((job) => job.claimedBy);
+      expect(owners.filter((owner) => owner === "1:a")).toHaveLength(3);
+      expect(owners.filter((owner) => owner === "2:b")).toHaveLength(3);
+    } finally {
+      first.close();
+      second.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a leased research task is skipped by every other claimer until the lease expires", async () => {
+    await withStore(async (store) => {
+      const job = store.create({ prompt: "research", model: "research", reasoning: "extended", options: {} });
+      store.claimNextQueued("1:a");
+      store.upsertResearchTask(job.id, { taskId: "deepresch_lease" });
+      store.deferResearchTask(job.id, new ProError("NETWORK_ERROR", "offline"), -1);
+
+      const resumed = store.claimNextRunnable({ owner: "2:b", leaseMs: 60_000 });
+      expect(resumed?.id).toBe(job.id);
+      expect(Date.parse(store.getResearchTask(job.id)?.nextPollAt ?? "")).toBeGreaterThan(Date.now() + 50_000);
+      expect(store.runningClaims()[0].claimedBy).toBe("2:b");
+      // Another daemon, and the legacy daemon's NULL-or-due query, both skip it now.
+      expect(store.claimNextRunnable({ owner: "3:c", leaseMs: 60_000 })).toBeNull();
+      expect(store.claimNextRunnable()).toBeNull();
+
+      store.renewResearchLeases([job.id], new Date(Date.now() - 1).toISOString());
+      expect(store.claimNextRunnable({ owner: "3:c", leaseMs: 60_000 })?.id).toBe(job.id);
+    });
+  });
+
+  test("research tasks written with a lease are fenced while the executor polls them", async () => {
+    await withStore(async (store) => {
+      const job = store.create({ prompt: "research", model: "research", reasoning: "extended", options: {} });
+      store.claimNextQueued("1:a");
+      const lease = new Date(Date.now() + 60_000).toISOString();
+      store.upsertResearchTask(job.id, { taskId: "deepresch_fenced" }, lease);
+      expect(store.claimNextRunnable({ owner: "2:b", leaseMs: 60_000 })).toBeNull();
+      store.updateResearchTaskStatus(job.id, "in_progress", lease);
+      expect(store.getResearchTask(job.id)?.nextPollAt).toBe(lease);
+      expect(store.claimNextRunnable({ owner: "2:b", leaseMs: 60_000 })).toBeNull();
+    });
+  });
+
+  test("a NULL next_poll_at belongs to a live legacy daemon and is free once it is gone", async () => {
+    await withStore(async (store) => {
+      const job = store.create({ prompt: "research", model: "research", reasoning: "extended", options: {} });
+      store.claimNextQueued();
+      store.upsertResearchTask(job.id, { taskId: "deepresch_legacy" });
+
+      expect(store.claimNextRunnable({ owner: "2:b", leaseMs: 60_000, legacyAlive: true })).toBeNull();
+      expect(store.claimNextRunnable({ owner: "2:b", leaseMs: 60_000, legacyAlive: false })?.id).toBe(job.id);
+    });
+  });
+
+  test("claimNextRunnable skips research jobs this daemon is already executing", async () => {
+    await withStore(async (store) => {
+      const job = store.create({ prompt: "research", model: "research", reasoning: "extended", options: {} });
+      store.claimNextQueued("1:a");
+      store.upsertResearchTask(job.id, { taskId: "deepresch_inflight" });
+      expect(store.claimNextRunnable({ owner: "1:a", exclude: new Set([job.id]) })).toBeNull();
+    });
+  });
+
+  test("requeueRunning puts a running job back in the queue and clears its owner", async () => {
+    await withStore(async (store) => {
+      const job = store.create({ prompt: "p", model: "gpt-5-5-pro", reasoning: "standard", options: {} });
+      store.claimNextQueued("1:a");
+      expect(store.requeueRunning(job.id)).toBe(true);
+      expect(store.get(job.id).status).toBe("queued");
+      expect(store.countQueued()).toBe(1);
+      expect(store.requeueRunning(job.id)).toBe(false);
+      expect(store.claimNextQueued("2:b")?.id).toBe(job.id);
+      expect(store.runningClaims()[0].claimedBy).toBe("2:b");
+    });
+  });
+
+  test("opening a database created before claimed_by existed migrates it in place", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pro-jobs-migrate-"));
+    const path = join(dir, "jobs.sqlite");
+    try {
+      const { Database } = await import("bun:sqlite");
+      const legacy = new Database(path, { create: true });
+      legacy.run(`CREATE TABLE jobs (
+        id TEXT PRIMARY KEY, status TEXT NOT NULL, prompt TEXT NOT NULL, model TEXT NOT NULL,
+        reasoning TEXT NOT NULL, options_json TEXT NOT NULL, result TEXT, error_json TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`);
+      legacy
+        .query("INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)")
+        .run("job_old", "running", "p", "gpt-5-5-pro", "standard", "{}", "2026-10-01T00:00:00.000Z", "2026-10-01T00:00:00.000Z");
+      legacy.close();
+
+      const store = await JobStore.open(path);
+      try {
+        expect(store.get("job_old").status).toBe("running");
+        expect(store.runningClaims()).toEqual([
+          { id: "job_old", claimedBy: null, hasResearchTask: false, nextPollAt: null },
+        ]);
+      } finally {
+        store.close();
+      }
+      // A second open (another process upgrading at the same time) is a no-op.
+      (await JobStore.open(path)).close();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});

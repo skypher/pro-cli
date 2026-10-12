@@ -27,6 +27,7 @@ async function withHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
     return await fn(home);
   } finally {
     await rm(home, { recursive: true, force: true });
+    await rm(daemonRuntimePathsForHome(home).dir, { recursive: true, force: true });
   }
 }
 
@@ -310,6 +311,37 @@ describe("robot-mode CLI", () => {
       expect(payload.data.daemon.state).toBe("stopped");
       expect(payload.data.daemon.home).toBe(home);
       expect(payload.data.daemon.endpointPath).toContain("pro-cli-");
+    });
+  });
+
+  test("daemon status reports no legacy daemon and daemon stop --legacy is a no-op without one", async () => {
+    await withHome(async (home) => {
+      const status = JSON.parse((await run(["daemon", "status", "--json"], { tty: true, home })).stdout);
+      expect(status.data.daemon.endpointPath).toEndWith("daemon-v2.json");
+      expect(status.data.daemon.legacy.state).toBe("stopped");
+      expect(status.data.daemon.legacy.endpointPath).toEndWith("daemon.json");
+
+      const stopped = await run(["daemon", "stop", "--legacy", "--json"], { tty: true, home });
+      expect(stopped.code).toBe(0);
+      const payload = JSON.parse(stopped.stdout);
+      expect(payload.data.legacy.stopped).toBe(false);
+      expect(payload.data.legacy.message).toContain("No legacy daemon");
+    });
+  });
+
+  test("config set daemon-concurrency validates and persists the value", async () => {
+    await withHome(async (home) => {
+      const set = await run(["config", "set", "daemon-concurrency", "4", "--json"], { tty: true, home });
+      expect(set.code).toBe(0);
+      expect(JSON.parse(set.stdout).data.config.daemonConcurrency).toBe(4);
+      const got = JSON.parse((await run(["config", "get", "--json"], { tty: true, home })).stdout);
+      expect(got.data.config.daemonConcurrency).toBe(4);
+      expect(got.data.defaults.daemonConcurrency).toBe(3);
+
+      for (const bad of ["0", "17", "two"]) {
+        const rejected = await run(["config", "set", "daemon-concurrency", bad, "--json"], { tty: true, home });
+        expect(rejected.code).toBe(EXIT.invalidArgs);
+      }
     });
   });
 
@@ -1535,8 +1567,8 @@ function daemonRuntimePathsForHome(home: string): { dir: string; endpointPath: s
   const dir = join("/tmp", `pro-cli-${uid}-${hash}`);
   return {
     dir,
-    endpointPath: join(dir, "daemon.json"),
-    logPath: join(dir, "daemon.log"),
+    endpointPath: join(dir, "daemon-v2.json"),
+    logPath: join(dir, "daemon-v2.log"),
   };
 }
 

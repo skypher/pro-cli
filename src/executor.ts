@@ -10,9 +10,14 @@ import {
   type TransportOptions,
 } from "./transport";
 
-interface ExecutorTransports {
+export interface ExecutorTransports {
   runJob?: (job: JobRecord, options: TransportOptions) => Promise<string>;
   runResearchTask?: (task: ResearchTask, options: TransportOptions) => Promise<string>;
+}
+
+interface ExecuteOptions {
+  /** Keep the research task fenced (next_poll_at in the future) while this process polls it. */
+  researchLeaseMs?: number;
 }
 
 export async function executeClaimedJob(
@@ -20,8 +25,11 @@ export async function executeClaimedJob(
   job: JobRecord,
   paths: RuntimePaths,
   transports: ExecutorTransports = {},
+  options: ExecuteOptions = {},
 ): Promise<Record<string, unknown>> {
   const observations: LimitsObservation[] = [];
+  const leaseUntil = (): string | null =>
+    options.researchLeaseMs === undefined ? null : new Date(Date.now() + options.researchLeaseMs).toISOString();
   const runJob = transports.runJob ?? runChatGptJob;
   const runResearchTask = transports.runResearchTask ?? runChatGptResearchTask;
   try {
@@ -36,10 +44,10 @@ export async function executeClaimedJob(
         job.options.keepConversation === true || typeof job.options.conversationId === "string",
       onLimits: (entries) => observations.push(...entries),
       onResearchTask: (task) => {
-        store.upsertResearchTask(job.id, task);
+        store.upsertResearchTask(job.id, task, leaseUntil());
       },
       onResearchTaskStatus: (update) => {
-        store.updateResearchTaskStatus(job.id, update.status);
+        store.updateResearchTaskStatus(job.id, update.status, leaseUntil());
       },
     };
     const existingTask = store.getResearchTask(job.id);

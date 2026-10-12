@@ -83,6 +83,10 @@ Keep the ChatGPT Chrome window open while jobs run. `pro-cli` sends requests fro
 
 Async jobs run through a local `pro-cli` daemon. `job create`, `job wait`, and `job cancel` start or restart it when needed, so agents do not need to manage a background process. The daemon processes `~/.pro-cli/jobs.sqlite`; those commands reach it through a localhost control endpoint stored under `/tmp`.
 
+The daemon runs up to 3 jobs at once by default; more are queued. Change it with `pro-cli config set daemon-concurrency <1-16>` (read when the daemon starts, so follow with `pro-cli daemon restart`). `daemon stop` and `daemon restart` are graceful: the daemon stops taking new work and the next command starts a fresh one, while jobs already running finish and keep their results. Add `--force` to stop at once.
+
+Older `pro-cli` versions ran one job at a time. If one of those daemons is still running it keeps serving older clients and finishing its work next to the new daemon; both share the job database, so any job id works from either. `pro-cli daemon status` shows it under `legacy`. Retire it with `pro-cli daemon stop --legacy`, which waits until it has nothing in flight; afterwards older clients are pointed at the new daemon.
+
 Use the dedicated `~/.pro-cli/chrome-profile` window for normal operation. A personal Chrome profile can work, but the debugging port exposes that profile while it is open. The dedicated profile limits scope to ChatGPT.
 
 If Chrome closes, run `pro-cli auth command --json` again. If ChatGPT logs out, sign in and rerun:
@@ -143,6 +147,7 @@ Daemon:
 pro-cli daemon status --json
 pro-cli daemon restart --json
 pro-cli daemon stop --json
+pro-cli daemon stop --legacy --json   # retire a pre-concurrency daemon once it is idle
 ```
 
 Direct ask:
