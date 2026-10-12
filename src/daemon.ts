@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { randomUUID, createHash } from "node:crypto";
+import { randomUUID, createHash, timingSafeEqual } from "node:crypto";
 import { closeSync, openSync } from "node:fs";
 import { readFile, unlink } from "node:fs/promises";
 import { join } from "node:path";
@@ -470,7 +470,9 @@ async function readEndpoint(path: string): Promise<DaemonEndpoint> {
 }
 
 function isAuthorized(request: Request, token: string): boolean {
-  return request.headers.get("authorization") === `Bearer ${token}`;
+  const presented = createHash("sha256").update(request.headers.get("authorization") ?? "").digest();
+  const expected = createHash("sha256").update(`Bearer ${token}`).digest();
+  return timingSafeEqual(presented, expected);
 }
 
 function isProcessAlive(pid: number): boolean {

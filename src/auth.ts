@@ -311,7 +311,18 @@ export async function captureAuth(options: CaptureOptions): Promise<AuthStatus> 
 
 export function defaultCdpBase(port: string | undefined, cdp: string | undefined): string {
   if (cdp) return cdp;
-  return `http://127.0.0.1:${port ?? "9222"}`;
+  return `http://127.0.0.1:${validateCdpPort(port ?? "9222")}`;
+}
+
+export function validateCdpPort(port: string): string {
+  const value = Number(port);
+  if (!/^\d{1,5}$/.test(port) || value < 1 || value > 65535) {
+    throw new ProError("INVALID_PORT", `Invalid CDP port: ${JSON.stringify(port)}.`, {
+      exitCode: EXIT.invalidArgs,
+      suggestions: ["Pass --port with an integer between 1 and 65535."],
+    });
+  }
+  return port;
 }
 
 async function getSessionAccessTokenFromPage(cdpBase: string, timeoutMs: number): Promise<string> {
@@ -386,6 +397,7 @@ export interface ResetProfileResult {
 }
 
 export async function resetAuthProfile(options: ResetProfileOptions): Promise<ResetProfileResult> {
+  validateCdpPort(options.port);
   const profileDir = join(options.home, "chrome-profile");
   if (!profileDir.startsWith(options.home + "/") && profileDir !== options.home) {
     throw new ProError("RESET_PATH_UNSAFE", "Refusing to reset a profile outside the pro-cli home.", {
@@ -413,10 +425,11 @@ export async function resetAuthProfile(options: ResetProfileOptions): Promise<Re
 
   let launched: ResetProfileResult["launched"] = null;
   if (!options.noLaunch) {
-    const command = buildOpenChromeCommand(profileDir, options.port);
-    const child = spawn("/bin/sh", ["-c", command], { detached: true, stdio: "ignore" });
+    const { file, args, verbatim } = openChromeArgv(profileDir, options.port);
+    const child = spawn(file, args, { detached: true, stdio: "ignore", windowsVerbatimArguments: verbatim });
+    child.on("error", () => undefined);
     child.unref();
-    launched = { command };
+    launched = { command: [file, ...args].map(displayQuote).join(" ") };
   }
 
   const cdp = `http://127.0.0.1:${options.port}`;
@@ -506,15 +519,28 @@ async function pruneOldBackups(home: string, keep: number): Promise<string[]> {
   return removed;
 }
 
-function buildOpenChromeCommand(profileDir: string, port: string): string {
+function openChromeArgv(profileDir: string, port: string): { file: string; args: string[]; verbatim?: boolean } {
   const url = "https://chatgpt.com/";
+  const chromeArgs = [`--user-data-dir=${profileDir}`, `--remote-debugging-port=${validateCdpPort(port)}`, url];
   if (process.platform === "darwin") {
-    return `open -na "Google Chrome" --args --user-data-dir='${profileDir}' --remote-debugging-port=${port} ${url}`;
+    return { file: "open", args: ["-na", "Google Chrome", "--args", ...chromeArgs] };
   }
   if (process.platform === "win32") {
-    return `start "" chrome.exe --user-data-dir="${profileDir}" --remote-debugging-port=${port} ${url}`;
+    // `start` is a cmd.exe builtin, so cmd still parses this line; refuse its metacharacters.
+    if (/["%^&|<>]/.test(profileDir)) {
+      throw new ProError("RESET_PATH_UNSAFE", "Refusing to launch Chrome with shell metacharacters in the profile path.", {
+        exitCode: EXIT.invalidArgs,
+        details: { profileDir },
+      });
+    }
+    const line = `start "" chrome.exe ${chromeArgs.map((arg) => `"${arg}"`).join(" ")}`;
+    return { file: "cmd.exe", args: ["/d", "/s", "/c", `"${line}"`], verbatim: true };
   }
-  return `google-chrome --user-data-dir='${profileDir}' --remote-debugging-port=${port} ${url}`;
+  return { file: "google-chrome", args: chromeArgs };
+}
+
+function displayQuote(value: string): string {
+  return /^[\w@%+=:,./-]+$/.test(value) ? value : `'${value.replace(/'/g, "'\\''")}'`;
 }
 
 function backupTimestamp(): string {

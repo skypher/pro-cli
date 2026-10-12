@@ -1265,6 +1265,24 @@ describe("robot-mode CLI", () => {
     });
   });
 
+  test("auth reset rejects a non-numeric --port before touching the profile", async () => {
+    await withHome(async (home) => {
+      await mkdir(join(home, "chrome-profile"), { recursive: true });
+      const result = await run(["auth", "reset", "--port", "9222; touch pwned", "--json"], { tty: true, home });
+      expect(result.code).toBe(2);
+      expect(JSON.parse(result.stderr).error.code).toBe("INVALID_PORT");
+      expect(await listEntries(home)).toContain("chrome-profile");
+    });
+  });
+
+  test("auth command rejects a non-numeric --port", async () => {
+    await withHome(async (home) => {
+      const result = await run(["auth", "command", "--port", "1$(id)", "--json"], { tty: true, home });
+      expect(result.code).toBe(2);
+      expect(JSON.parse(result.stderr).error.code).toBe("INVALID_PORT");
+    });
+  });
+
   test("auth reset (default) backs up the profile dir to chrome-profile.backup-<ts>", async () => {
     await withHome(async (home) => {
       await mkdir(join(home, "chrome-profile", "Default"), { recursive: true });

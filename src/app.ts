@@ -10,6 +10,7 @@ import {
   getAuthStatus,
   getBrowserSessionStatus,
   hideProCliChromeWindow,
+  validateCdpPort,
   resetAuthProfile,
   showProCliChromeWindow,
 } from "./auth";
@@ -704,6 +705,7 @@ function buildSetupGuide(auth: Awaited<ReturnType<typeof getAuthStatus>>, home: 
 }
 
 function buildAuthCommand(home: string, port: string): Record<string, unknown> {
+  validateCdpPort(port);
   const profileDir = join(home, "chrome-profile");
   const url = "https://chatgpt.com/";
   const cdp = `http://127.0.0.1:${port}`;
