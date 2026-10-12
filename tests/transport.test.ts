@@ -1381,6 +1381,157 @@ describe("ChatGPT transport", () => {
   });
 });
 
+describe("ChatGPT transport: cut-off answer streams", () => {
+  test("polls the conversation for the answer when the stream ends before the answer", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const diagnosticsDir = await mkdtemp(join(tmpdir(), "pro-stream-diag-"));
+      try {
+        const answerFetches: string[] = [];
+        const pageEvaluator = (async <T>(_base: string, script: string): Promise<T> => {
+          if (script.includes("fetchConversationAnswer")) {
+            answerFetches.push(script);
+            return (answerFetches.length === 1
+              ? { ok: true, status: 200, state: "pending", text: null, message: "assistant thoughts in_progress" }
+              : { ok: true, status: 200, state: "done", text: "Recovered answer", message: "assistant text finished_successfully end_turn" }) as T;
+          }
+          return { ok: true, status: 200, body: cutOffStream("conv_cut") } as T;
+        });
+
+        const result = await runChatGptJob(job(), {
+          sessionTokenPath,
+          pageEvaluator,
+          diagnosticsDir,
+          streamRecoveryPollMs: 0,
+        });
+
+        expect(result).toBe("Recovered answer");
+        expect(answerFetches).toHaveLength(2);
+        expect(answerFetches[0]).toContain('"conv_cut"');
+        const diagnostics = await readFile(join(diagnosticsDir, "job_test-stream.json"), "utf8");
+        expect(JSON.parse(diagnostics)).toMatchObject({
+          jobId: "job_test",
+          code: "STREAM_INCOMPLETE",
+          conversationId: "conv_cut",
+          sawDone: false,
+          sawStreamComplete: false,
+        });
+        expect(diagnostics).toContain("msg user text finished_successfully");
+        expect(diagnostics).not.toContain("secret question text");
+        expect(diagnostics).not.toContain("resume-token-value");
+      } finally {
+        await rm(diagnosticsDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  test("does not accept partial answer text from a stream that was cut off", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const pageEvaluator = (async <T>(_base: string, script: string): Promise<T> => {
+        if (script.includes("fetchConversationAnswer")) {
+          return { ok: true, status: 200, state: "done", text: "Partial answer, then the rest.", message: null } as T;
+        }
+        return {
+          ok: true,
+          status: 200,
+          body: cutOffStream("conv_partial", [
+            'data: {"p":"/message/content/parts/0","o":"append","v":"Partial answer"}',
+          ]),
+        } as T;
+      });
+
+      const result = await runChatGptJob(job(), { sessionTokenPath, pageEvaluator, streamRecoveryPollMs: 0 });
+
+      expect(result).toBe("Partial answer, then the rest.");
+    });
+  });
+
+  test("keeps the stream error with diagnostics when the conversation cannot be fetched", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const diagnosticsDir = await mkdtemp(join(tmpdir(), "pro-stream-diag-"));
+      try {
+        let answerFetches = 0;
+        const pageEvaluator = (async <T>(_base: string, script: string): Promise<T> => {
+          if (script.includes("fetchConversationAnswer")) {
+            answerFetches += 1;
+            return { ok: false, status: 404, state: "pending", text: null, message: null } as T;
+          }
+          return { ok: true, status: 200, body: cutOffStream("conv_gone") } as T;
+        });
+
+        try {
+          await runChatGptJob(job(), { sessionTokenPath, pageEvaluator, diagnosticsDir, streamRecoveryPollMs: 0 });
+          throw new Error("Expected STREAM_INCOMPLETE.");
+        } catch (error) {
+          expect(error).toBeInstanceOf(ProError);
+          const proError = error as ProError;
+          expect(proError.code).toBe("STREAM_INCOMPLETE");
+          expect(proError.details).toMatchObject({
+            attempts: 1,
+            conversationId: "conv_gone",
+            stream: { sawDone: false, sawStreamComplete: false },
+            recovery: { state: "unavailable", status: 404, polls: 3 },
+            diagnosticsPath: join(diagnosticsDir, "job_test-stream.json"),
+          });
+        }
+        expect(answerFetches).toBe(3);
+      } finally {
+        await rm(diagnosticsDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  test("reports an empty stored answer as EMPTY_RESPONSE without waiting", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const pageEvaluator = (async <T>(_base: string, script: string): Promise<T> => {
+        if (script.includes("fetchConversationAnswer")) {
+          return { ok: true, status: 200, state: "empty", text: null, message: "assistant text finished_successfully end_turn" } as T;
+        }
+        return {
+          ok: true,
+          status: 200,
+          body: [
+            'data: {"conversation_id":"conv_empty","message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":[]},"status":"finished_successfully","end_turn":true}}',
+            "data: [DONE]",
+            "",
+          ].join("\n\n"),
+        } as T;
+      });
+
+      try {
+        await runChatGptJob(job(), { sessionTokenPath, pageEvaluator, streamRecoveryPollMs: 0 });
+        throw new Error("Expected EMPTY_RESPONSE.");
+      } catch (error) {
+        expect((error as ProError).code).toBe("EMPTY_RESPONSE");
+        expect((error as ProError).details).toMatchObject({
+          conversationId: "conv_empty",
+          stream: { sawDone: true },
+          recovery: { state: "empty", polls: 1 },
+        });
+      }
+    });
+  });
+
+  test("stops reading the stream in the page before the CDP evaluation times out", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      let expression = "";
+      let evaluateTimeoutMs: number | undefined;
+      const pageEvaluator = (async <T>(_base: string, script: string, timeoutMs?: number): Promise<T> => {
+        expression = script;
+        evaluateTimeoutMs = timeoutMs;
+        return { ok: true, status: 200, body: conversationStream("OK") } as T;
+      });
+
+      await runChatGptJob(job(), { sessionTokenPath, pageEvaluator });
+      expect(evaluateTimeoutMs).toBe(30 * 60_000);
+      expect(expression.endsWith(', "acct_test", 1680000)')).toBe(true);
+
+      await runChatGptJob(job(), { sessionTokenPath, pageEvaluator, timeoutMs: 60_000 });
+      expect(evaluateTimeoutMs).toBe(60_000);
+      expect(expression.endsWith(', "acct_test", 48000)')).toBe(true);
+    });
+  });
+});
+
 function job(patch: Partial<Pick<JobRecord, "model" | "reasoning">> = {}): JobRecord {
   const now = new Date().toISOString();
   return {
@@ -1419,6 +1570,19 @@ function conversationStream(text: string): string {
   return [
     `data: {"message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":[${JSON.stringify(text)}]},"status":"finished_successfully"}}`,
     "data: [DONE]",
+    "",
+  ].join("\n\n");
+}
+
+// A long answer stream that ended before the answer finished: the conversation id
+// and the user's message arrived, reasoning finished, and no turn terminator followed.
+function cutOffStream(conversationId: string, extraFrames: string[] = []): string {
+  return [
+    'event: delta_encoding\ndata: "v1"',
+    `data: {"type":"resume_conversation_token","conversation_id":${JSON.stringify(conversationId)},"token":"resume-token-value"}`,
+    `data: {"p":"","o":"add","v":{"message":{"author":{"role":"user"},"content":{"content_type":"text","parts":["secret question text"]},"status":"finished_successfully"},"conversation_id":${JSON.stringify(conversationId)}},"c":0}`,
+    'data: {"v":{"message":{"author":{"role":"assistant"},"content":{"content_type":"thoughts","thoughts":[]},"status":"finished_successfully"}},"c":1}',
+    ...extraFrames,
     "",
   ].join("\n\n");
 }
@@ -1481,7 +1645,7 @@ function requestBodyFromExpression(expression: string): Record<string, unknown> 
   const start = expression.lastIndexOf(marker);
   expect(start).toBeGreaterThanOrEqual(0);
   const bodyStart = start + marker.length;
-  const bodyEnd = expression.lastIndexOf(', "acct_test")');
+  const bodyEnd = expression.lastIndexOf(', "acct_test", ');
   expect(bodyEnd).toBeGreaterThan(bodyStart);
   return JSON.parse(expression.slice(bodyStart, bodyEnd)) as Record<string, unknown>;
 }

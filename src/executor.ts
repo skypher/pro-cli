@@ -40,6 +40,7 @@ export async function executeClaimedJob(
       retries: numberFromOption(job.options.retries),
       retryDelayMs: numberFromOption(job.options.retryDelayMs),
       artifactDir: join(paths.home, "images", job.id),
+      diagnosticsDir: join(paths.home, "diagnostics"),
       keepImageConversation:
         job.options.keepConversation === true || typeof job.options.conversationId === "string",
       onLimits: (entries) => observations.push(...entries),
@@ -123,6 +124,7 @@ export async function executeEphemeralJob(
       retries: numberFromOption(job.options.retries),
       retryDelayMs: numberFromOption(job.options.retryDelayMs),
       artifactDir: join(paths.home, "images", job.id),
+      diagnosticsDir: join(paths.home, "diagnostics"),
       keepImageConversation:
         job.options.keepConversation === true || typeof job.options.conversationId === "string",
       onLimits: (entries) => observations.push(...entries),

@@ -21,6 +21,9 @@ const DEEP_RESEARCH_ROUTER_MODEL = "gpt-5-5";
 const IMAGE_TASK_PREFIX = "image:";
 const DEFAULT_IMAGE_POLL_MS = 3_000;
 const DEFAULT_IMAGE_RATE_LIMIT_POLL_MS = 30_000;
+const BROWSER_STREAM_MARGIN_MS = 2 * 60_000;
+const STREAM_RECOVERY_POLL_MS = 15_000;
+const STREAM_RECOVERY_DEFAULT_MS = 60 * 60_000;
 
 type PageEvaluator = <T>(cdpBase: string, expression: string, timeoutMs?: number) => Promise<T>;
 
@@ -32,6 +35,8 @@ export interface TransportOptions {
   retries?: number;
   retryDelayMs?: number;
   artifactDir?: string;
+  diagnosticsDir?: string;
+  streamRecoveryPollMs?: number;
   onLimits?: (observations: LimitsObservation[]) => void;
   onResearchTask?: (task: ResearchTask) => void | Promise<void>;
   onResearchTaskStatus?: (update: ResearchTaskStatusUpdate) => void | Promise<void>;
@@ -154,6 +159,9 @@ async function postChatGptJob(
   attachments: UploadedAttachment[] = [],
 ): Promise<string> {
   const timeoutMs = integerOption(options.timeoutMs ?? job.options.timeoutMs, 0, 0, MAX_REQUEST_TIMEOUT_MS) ?? 0;
+  const requestStartedAt = Date.now();
+  const browserTimeoutMs = timeoutMs || DEFAULT_BROWSER_REQUEST_TIMEOUT_MS;
+  const streamBudgetMs = Math.max(Math.floor(browserTimeoutMs * 0.8), browserTimeoutMs - BROWSER_STREAM_MARGIN_MS);
 
   try {
     const evaluate = options.pageEvaluator ?? evaluateInCdpPage;
@@ -166,16 +174,16 @@ async function postChatGptJob(
     for (const attachment of attachments) baselineImageFileIds.add(attachment.fileId);
     let browserResult = await evaluate<BrowserFetchResult>(
       cdpBase,
-      buildBrowserFetchExpression(buildRequestBody(job, attachments), session.accountId),
-      timeoutMs || DEFAULT_BROWSER_REQUEST_TIMEOUT_MS,
+      buildBrowserFetchExpression(buildRequestBody(job, attachments), session.accountId, streamBudgetMs),
+      browserTimeoutMs,
     );
     if (!options.pageEvaluator && shouldRecoverCookieBloat(browserResult)) {
       const recovered = await recoverCookieBloatInCdp(cdpBase, chatGptOrigins(), timeoutMs || 10_000).catch(() => null);
       if (recovered?.deleted) {
         browserResult = await evaluate<BrowserFetchResult>(
           cdpBase,
-          buildBrowserFetchExpression(buildRequestBody(job, attachments), session.accountId),
-          timeoutMs || DEFAULT_BROWSER_REQUEST_TIMEOUT_MS,
+          buildBrowserFetchExpression(buildRequestBody(job, attachments), session.accountId, streamBudgetMs),
+          browserTimeoutMs,
         );
       }
     }
@@ -240,9 +248,23 @@ async function postChatGptJob(
     }
 
     const model = canonicalModelId(job.model);
-    const parsed = readResponse(browserResult.body, options.onLimits, {
-      allowEmptyWithConversation: model === "image",
-    });
+    let parsed: ParsedConversationResponse;
+    try {
+      parsed = readResponse(browserResult.body, options.onLimits, {
+        allowEmptyWithConversation: model === "image",
+      });
+    } catch (error) {
+      if (!(error instanceof ProError) || !isRecoverableStreamError(error) || model === "image" || model === "research") {
+        throw error;
+      }
+      return await recoverConversationAnswer(job, error, browserResult.body, {
+        evaluate,
+        cdpBase,
+        requestStartedAt,
+        timeoutMs,
+        options,
+      });
+    }
     if (model === "image") {
       if (parsed.text.toLowerCase().includes("image generation isn") && parsed.text.toLowerCase().includes("temporary chat")) {
         throw new ProError("IMAGE_TEMPORARY_UNAVAILABLE", "ChatGPT image generation is not available in temporary chats.", {
@@ -317,12 +339,18 @@ interface BrowserFetchResult {
   code?: "CHATGPT_PAGE_MISSING" | "CHATGPT_PAGE_LOGGED_OUT" | "CHATGPT_PROBE_FAILED";
 }
 
-function buildBrowserFetchExpression(requestBody: Record<string, unknown>, accountId: string): string {
+function buildBrowserFetchExpression(
+  requestBody: Record<string, unknown>,
+  accountId: string,
+  streamBudgetMs: number,
+): string {
   return `(${async function browserFetch(
     endpoint: string,
     body: Record<string, unknown>,
     account: string,
+    streamBudget: number,
   ): Promise<BrowserFetchResult> {
+    const streamDeadline = Date.now() + streamBudget;
     if (location.origin !== "https://chatgpt.com") {
       return {
         ok: false,
@@ -390,8 +418,8 @@ function buildBrowserFetchExpression(requestBody: Record<string, unknown>, accou
       headers,
       body: JSON.stringify({ ...requestBody, client_prepare_state: prepareResponse.ok ? "sent" : "none" }),
     });
-    let text = await response.text().catch((error) => String(error));
-    if (response.ok) {
+    let text = await readStreamText(response);
+    if (response.ok && Date.now() < streamDeadline) {
       const resumedText = await resumeHandoffStream(text, accessToken, turnTraceId, referrer);
       if (resumedText) text = `${text}\n\n${resumedText}`;
     }
@@ -500,11 +528,40 @@ function buildBrowserFetchExpression(requestBody: Record<string, unknown>, accou
           }),
           body: JSON.stringify({ conversation_id: handoff.conversationId, offset }),
         });
-        const resumeText = await resumeResponse.text().catch(() => "");
+        const resumeText = await readStreamText(resumeResponse);
         if (resumeResponse.ok && resumeText.trim()) return resumeText;
         if (resumeResponse.status !== 404) return null;
       }
       return null;
+    }
+
+    // Stop reading before the CDP evaluation times out. The caller gets the partial
+    // stream, including the conversation id, and polls the conversation for the answer.
+    async function readStreamText(streamResponse: Response): Promise<string> {
+      const reader = streamResponse.body?.getReader();
+      if (!reader) return await streamResponse.text().catch((error) => String(error));
+      const decoder = new TextDecoder();
+      let streamText = "";
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const expired = new Promise<"expired">((resolve) => {
+        timer = setTimeout(() => resolve("expired"), Math.max(0, streamDeadline - Date.now()));
+      });
+      try {
+        while (true) {
+          const chunk = await Promise.race([reader.read(), expired]);
+          if (chunk === "expired") {
+            await reader.cancel().catch(() => undefined);
+            break;
+          }
+          if (chunk.done) break;
+          streamText += decoder.decode(chunk.value, { stream: true });
+        }
+        return streamText + decoder.decode();
+      } catch (error) {
+        return streamText || String(error);
+      } finally {
+        clearTimeout(timer);
+      }
     }
 
     function readHandoff(streamText: string): { conversationId: string; token: string } | null {
@@ -999,7 +1056,7 @@ function buildBrowserFetchExpression(requestBody: Record<string, unknown>, accou
       hash ^= hash >>> 16;
       return (hash >>> 0).toString(16).padStart(8, "0");
     }
-  }})(${JSON.stringify(CHATGPT_CONVERSATION_ENDPOINT)}, ${JSON.stringify(requestBody)}, ${JSON.stringify(accountId)})`;
+  }})(${JSON.stringify(CHATGPT_CONVERSATION_ENDPOINT)}, ${JSON.stringify(requestBody)}, ${JSON.stringify(accountId)}, ${JSON.stringify(streamBudgetMs)})`;
 }
 
 interface PreparedChatRequirements {
@@ -1237,6 +1294,306 @@ function readResponse(
   }
 
   return { text: completedText ?? "", asyncTask, deepResearchWidget, conversationId };
+}
+
+function isRecoverableStreamError(error: ProError): boolean {
+  return error.code === "EMPTY_RESPONSE" || error.code === "STREAM_INCOMPLETE";
+}
+
+interface StreamSummary {
+  bytes: number;
+  frames: number;
+  conversationId: string | null;
+  sawDone: boolean;
+  sawStreamComplete: boolean;
+  lastCounter: number | null;
+  events: string[];
+}
+
+// Describes the stream's structure (event types, patch paths, message roles and
+// statuses, lengths) without any prompt or answer text, so a failed stream can be
+// diagnosed after the fact.
+function summarizeConversationStream(raw: string): StreamSummary {
+  const summary: StreamSummary = {
+    bytes: raw.length,
+    frames: 0,
+    conversationId: null,
+    sawDone: false,
+    sawStreamComplete: false,
+    lastCounter: null,
+    events: [],
+  };
+  let previous: string | null = null;
+  let repeats = 0;
+  const flush = (): void => {
+    if (previous === null) return;
+    summary.events.push(repeats > 1 ? `${previous} x${repeats}` : previous);
+  };
+  for (const frame of raw.replace(/\r\n?/g, "\n").split("\n\n")) {
+    if (!frame.trim()) continue;
+    summary.frames += 1;
+    const eventName = frame.split("\n").find((line) => line.startsWith("event:"))?.slice(6).trim();
+    let event: unknown;
+    try {
+      event = parseSseFrame(frame);
+    } catch {
+      event = undefined;
+    }
+    if (isRecord(event)) {
+      if (event.type === "done") summary.sawDone = true;
+      if (event.type === "message_stream_complete") summary.sawStreamComplete = true;
+      if (typeof event.c === "number") summary.lastCounter = event.c;
+      summary.conversationId = extractConversationId(event) ?? summary.conversationId;
+    }
+    const description = `${eventName ? `[${eventName}] ` : ""}${describeStreamEvent(event)}`;
+    if (description === previous) {
+      repeats += 1;
+    } else {
+      flush();
+      previous = description;
+      repeats = 1;
+    }
+  }
+  flush();
+  if (summary.events.length > 400) {
+    const omitted = summary.events.length - 400;
+    summary.events = [...summary.events.slice(0, 100), `... ${omitted} more ...`, ...summary.events.slice(-300)];
+  }
+  return summary;
+}
+
+function describeStreamEvent(event: unknown): string {
+  if (event === undefined) return "unparsable";
+  if (event === null) return "no-data";
+  if (!isRecord(event)) return typeof event;
+  const parts: string[] = [];
+  if (typeof event.type === "string") parts.push(event.type);
+  if (typeof event.o === "string") parts.push(typeof event.p === "string" && event.p ? `${event.o} ${event.p}` : event.o);
+  if (event.o === "patch" && Array.isArray(event.v)) {
+    const ops = event.v
+      .filter(isRecord)
+      .map((patch) => `${String(patch.o)} ${String(patch.p)}`);
+    parts.push(`[${[...new Set(ops)].slice(0, 6).join(", ")}]`);
+  }
+  const value = isRecord(event.v) ? event.v : null;
+  const message = event.message ?? value?.message;
+  if (isRecord(message)) parts.push(describeStreamMessage(message));
+  if (parts.length === 0) {
+    parts.push(typeof event.v === "string" ? "text" : `keys:${Object.keys(event).slice(0, 6).join(",")}`);
+  }
+  return parts.join(" ");
+}
+
+function describeStreamMessage(message: Record<string, unknown>): string {
+  const author = isRecord(message.author) ? message.author : {};
+  const content = isRecord(message.content) ? message.content : {};
+  const metadata = isRecord(message.metadata) ? message.metadata : {};
+  const finishDetails = isRecord(metadata.finish_details) ? metadata.finish_details : {};
+  const textParts = Array.isArray(content.parts) ? content.parts.filter((part) => typeof part === "string") : [];
+  const fields = [
+    `msg ${String(author.role)}${typeof author.name === "string" ? `/${author.name}` : ""}`,
+    String(content.content_type),
+    String(message.status),
+    ...(message.end_turn === true ? ["end_turn"] : []),
+    ...(typeof message.recipient === "string" && message.recipient !== "all" ? [`to=${message.recipient}`] : []),
+    `chars=${textParts.reduce((total, part) => total + part.length, 0)}`,
+    ...(typeof finishDetails.type === "string" ? [`finish=${finishDetails.type}`] : []),
+  ];
+  return fields.join(" ");
+}
+
+async function writeStreamDiagnostics(
+  dir: string | undefined,
+  job: JobRecord,
+  code: string,
+  summary: StreamSummary,
+): Promise<string | null> {
+  if (!dir) return null;
+  try {
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    const path = join(dir, `${job.id}-stream.json`);
+    const record = { jobId: job.id, code, recordedAt: new Date().toISOString(), ...summary };
+    await writeFile(path, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+    return path;
+  } catch {
+    return null;
+  }
+}
+
+interface ConversationAnswerFetchResult {
+  ok: boolean;
+  status: number;
+  state: "done" | "pending" | "empty" | "incomplete";
+  text: string | null;
+  message: string | null;
+}
+
+interface ConversationAnswerRecovery {
+  state: "done" | "pending" | "empty" | "incomplete" | "unavailable" | "timeout" | "error";
+  status?: number;
+  polls: number;
+  message?: string | null;
+  error?: string;
+}
+
+// The answer stream can end before ChatGPT finishes the turn (for example when a
+// long Pro run outlives the connection). The turn keeps running server-side, so poll
+// the stored conversation for the final assistant message instead of failing.
+async function recoverConversationAnswer(
+  job: JobRecord,
+  streamError: ProError,
+  rawStream: string,
+  context: {
+    evaluate: PageEvaluator;
+    cdpBase: string;
+    requestStartedAt: number;
+    timeoutMs: number;
+    options: TransportOptions;
+  },
+): Promise<string> {
+  const stream = summarizeConversationStream(rawStream);
+  const diagnosticsPath = await writeStreamDiagnostics(context.options.diagnosticsDir, job, streamError.code, stream);
+  let recovery: ConversationAnswerRecovery | null = null;
+  if (stream.conversationId) {
+    const budgetMs = context.timeoutMs > 0
+      ? context.timeoutMs - (Date.now() - context.requestStartedAt)
+      : STREAM_RECOVERY_DEFAULT_MS;
+    const result = await pollConversationAnswer(stream.conversationId, context.evaluate, context.cdpBase, {
+      notBefore: context.requestStartedAt - 60_000,
+      deadline: Date.now() + Math.max(0, budgetMs),
+      pollMs: integerOption(context.options.streamRecoveryPollMs, STREAM_RECOVERY_POLL_MS, 0, 60_000)
+        ?? STREAM_RECOVERY_POLL_MS,
+    });
+    if (result.text !== null) {
+      validateCompletedResult(job, result.text);
+      return result.text;
+    }
+    recovery = result.recovery;
+  }
+  throw new ProError(streamError.code, streamError.message, {
+    exitCode: streamError.exitCode,
+    suggestions: streamError.suggestions,
+    details: {
+      ...(streamError.details ?? {}),
+      conversationId: stream.conversationId,
+      stream: {
+        bytes: stream.bytes,
+        frames: stream.frames,
+        sawDone: stream.sawDone,
+        sawStreamComplete: stream.sawStreamComplete,
+        tail: stream.events.slice(-8),
+      },
+      recovery,
+      ...(diagnosticsPath ? { diagnosticsPath } : {}),
+    },
+  });
+}
+
+async function pollConversationAnswer(
+  conversationId: string,
+  evaluate: PageEvaluator,
+  cdpBase: string,
+  options: { notBefore: number; deadline: number; pollMs: number },
+): Promise<{ text: string | null; recovery: ConversationAnswerRecovery }> {
+  let polls = 0;
+  let failures = 0;
+  let last: ConversationAnswerFetchResult | null = null;
+  while (true) {
+    polls += 1;
+    try {
+      last = await evaluate<ConversationAnswerFetchResult>(
+        cdpBase,
+        buildConversationAnswerFetchExpression(conversationId, options.notBefore / 1000),
+        30_000,
+      );
+      failures = 0;
+    } catch (error) {
+      failures += 1;
+      if (failures > 3) {
+        return { text: null, recovery: { state: "error", polls, error: error instanceof Error ? error.message : String(error) } };
+      }
+    }
+    if (last && last.ok && last.state === "done" && last.text) {
+      return { text: last.text, recovery: { state: "done", status: last.status, polls } };
+    }
+    if (last && last.ok && (last.state === "empty" || last.state === "incomplete")) {
+      return { text: null, recovery: { state: last.state, status: last.status, polls, message: last.message } };
+    }
+    if (last && !last.ok && (last.status !== 404 || polls >= 3)) {
+      return { text: null, recovery: { state: "unavailable", status: last.status, polls } };
+    }
+    if (Date.now() + options.pollMs > options.deadline) {
+      return {
+        text: null,
+        recovery: { state: "timeout", ...(last ? { status: last.status, message: last.message } : {}), polls },
+      };
+    }
+    await sleep(options.pollMs);
+  }
+}
+
+function buildConversationAnswerFetchExpression(conversationId: string, notBeforeSeconds: number): string {
+  return `(${async function fetchConversationAnswer(
+    id: string,
+    notBefore: number,
+  ): Promise<ConversationAnswerFetchResult> {
+    const sessionResponse = await fetch("https://chatgpt.com/api/auth/session", {
+      credentials: "include",
+      referrerPolicy: "no-referrer",
+    });
+    const session = (await sessionResponse.json().catch(() => null)) as { accessToken?: unknown } | null;
+    const accessToken = typeof session?.accessToken === "string" ? session.accessToken : "";
+    const response = await fetch(
+      `https://chatgpt.com/backend-api/conversation/${encodeURIComponent(id)}`,
+      {
+        credentials: "include",
+        referrer: "https://chatgpt.com/",
+        headers: {
+          accept: "application/json",
+          ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}),
+        },
+      },
+    );
+    const body = (await response.json().catch(() => null)) as { mapping?: unknown; current_node?: unknown } | null;
+    if (!response.ok || !body || typeof body !== "object") {
+      return { ok: false, status: response.status, state: "pending", text: null, message: null };
+    }
+    const mapping = body.mapping && typeof body.mapping === "object"
+      ? body.mapping as Record<string, { message?: unknown }>
+      : {};
+    const node = typeof body.current_node === "string" ? mapping[body.current_node] : undefined;
+    const message = node?.message as {
+      author?: { role?: unknown; name?: unknown };
+      content?: { content_type?: unknown; parts?: unknown };
+      status?: unknown;
+      end_turn?: unknown;
+      recipient?: unknown;
+      create_time?: unknown;
+    } | undefined;
+    if (!message) return { ok: true, status: response.status, state: "pending", text: null, message: null };
+    const role = typeof message.author?.role === "string" ? message.author.role : "unknown";
+    const contentType = typeof message.content?.content_type === "string" ? message.content.content_type : "unknown";
+    const status = typeof message.status === "string" ? message.status : "unknown";
+    const summary = `${role} ${contentType} ${status}${message.end_turn === true ? " end_turn" : ""}`;
+    const createdAt = typeof message.create_time === "number" ? message.create_time : null;
+    const isCurrentTurn = createdAt === null || createdAt >= notBefore;
+    const isAnswer =
+      role === "assistant" &&
+      (message.recipient === undefined || message.recipient === null || message.recipient === "all") &&
+      (contentType === "text" || contentType === "multimodal_text");
+    if (!isCurrentTurn || !isAnswer || status === "in_progress" || message.end_turn === false) {
+      return { ok: true, status: response.status, state: "pending", text: null, message: summary };
+    }
+    const parts = Array.isArray(message.content?.parts)
+      ? message.content.parts.filter((part): part is string => typeof part === "string")
+      : [];
+    const text = parts.join("");
+    if (status !== "finished_successfully") {
+      return { ok: true, status: response.status, state: "incomplete", text: null, message: summary };
+    }
+    if (!text.trim()) return { ok: true, status: response.status, state: "empty", text: null, message: summary };
+    return { ok: true, status: response.status, state: "done", text, message: summary };
+  }})(${JSON.stringify(conversationId)}, ${JSON.stringify(notBeforeSeconds)})`;
 }
 
 async function waitForResearchTask(
@@ -2750,10 +3107,27 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object";
 }
 
+// Only the assistant's answer ends a turn. User, system, tool, and reasoning
+// messages also finish, and treating them as the end would accept a stream that
+// was cut off before or during the answer.
 function isConversationMessageDone(event: Record<string, unknown>): boolean {
   const value = event.v as { message?: unknown } | undefined;
-  const message = (event.message ?? value?.message) as { status?: unknown; end_turn?: unknown } | undefined;
-  return message?.status === "finished_successfully" || message?.end_turn === true;
+  const message = (event.message ?? value?.message) as {
+    author?: { role?: unknown };
+    content?: { content_type?: unknown };
+    status?: unknown;
+    end_turn?: unknown;
+    recipient?: unknown;
+  } | undefined;
+  if (message?.author?.role !== "assistant") return false;
+  if (message.end_turn === true) return true;
+  const contentType = message.content?.content_type;
+  return (
+    message.status === "finished_successfully" &&
+    message.end_turn !== false &&
+    (message.recipient === undefined || message.recipient === null || message.recipient === "all") &&
+    (contentType === "text" || contentType === "multimodal_text")
+  );
 }
 
 function readErrorMessage(event: Record<string, unknown>): string {
