@@ -23,7 +23,9 @@ const DEFAULT_IMAGE_POLL_MS = 3_000;
 const DEFAULT_IMAGE_RATE_LIMIT_POLL_MS = 30_000;
 const BROWSER_STREAM_MARGIN_MS = 2 * 60_000;
 const STREAM_RECOVERY_POLL_MS = 15_000;
-const STREAM_RECOVERY_DEFAULT_MS = 60 * 60_000;
+// Without --timeout, a job waits this long in total for a Pro answer; long Pro
+// runs can take well over an hour.
+const DEFAULT_ANSWER_WAIT_MS = 3 * 60 * 60_000;
 
 type PageEvaluator = <T>(cdpBase: string, expression: string, timeoutMs?: number) => Promise<T>;
 
@@ -1232,7 +1234,7 @@ function readResponse(
   let deepResearchWidget: ResearchTask | null = null;
   let conversationId: string | null = null;
   let completed = false;
-  const state: ResponseParseState = { acceptsTextContinuation: false, lastAppendText: null };
+  const state: ResponseParseState = { acceptsTextContinuation: false, lastAppendText: null, inProgressNote: false };
 
   let boundary = buffer.indexOf("\n\n");
   while (boundary !== -1) {
@@ -1282,7 +1284,7 @@ function readResponse(
     });
   }
 
-  if (completedText === null && !asyncTask && !deepResearchWidget && !(options.allowEmptyWithConversation && conversationId)) {
+  if (!completedText?.trim() && !asyncTask && !deepResearchWidget && !(options.allowEmptyWithConversation && conversationId)) {
     throw new ProError("EMPTY_RESPONSE", "ChatGPT completed without returning assistant text.", {
       exitCode: EXIT.upstream,
       suggestions: [
@@ -1394,6 +1396,7 @@ function describeStreamMessage(message: Record<string, unknown>): string {
     `msg ${String(author.role)}${typeof author.name === "string" ? `/${author.name}` : ""}`,
     String(content.content_type),
     String(message.status),
+    ...(typeof message.channel === "string" ? [`channel=${message.channel}`] : []),
     ...(message.end_turn === true ? ["end_turn"] : []),
     ...(typeof message.recipient === "string" && message.recipient !== "all" ? [`to=${message.recipient}`] : []),
     `chars=${textParts.reduce((total, part) => total + part.length, 0)}`,
@@ -1455,12 +1458,10 @@ async function recoverConversationAnswer(
   const diagnosticsPath = await writeStreamDiagnostics(context.options.diagnosticsDir, job, streamError.code, stream);
   let recovery: ConversationAnswerRecovery | null = null;
   if (stream.conversationId) {
-    const budgetMs = context.timeoutMs > 0
-      ? context.timeoutMs - (Date.now() - context.requestStartedAt)
-      : STREAM_RECOVERY_DEFAULT_MS;
+    const answerWaitMs = context.timeoutMs > 0 ? context.timeoutMs : DEFAULT_ANSWER_WAIT_MS;
     const result = await pollConversationAnswer(stream.conversationId, context.evaluate, context.cdpBase, {
       notBefore: context.requestStartedAt - 60_000,
-      deadline: Date.now() + Math.max(0, budgetMs),
+      deadline: context.requestStartedAt + answerWaitMs,
       pollMs: integerOption(context.options.streamRecoveryPollMs, STREAM_RECOVERY_POLL_MS, 0, 60_000)
         ?? STREAM_RECOVERY_POLL_MS,
     });
@@ -1561,34 +1562,56 @@ function buildConversationAnswerFetchExpression(conversationId: string, notBefor
     const mapping = body.mapping && typeof body.mapping === "object"
       ? body.mapping as Record<string, { message?: unknown }>
       : {};
-    const node = typeof body.current_node === "string" ? mapping[body.current_node] : undefined;
-    const message = node?.message as {
-      author?: { role?: unknown; name?: unknown };
+    type StoredMessage = {
+      author?: { role?: unknown };
       content?: { content_type?: unknown; parts?: unknown };
       status?: unknown;
       end_turn?: unknown;
       recipient?: unknown;
+      channel?: unknown;
       create_time?: unknown;
-    } | undefined;
-    if (!message) return { ok: true, status: response.status, state: "pending", text: null, message: null };
-    const role = typeof message.author?.role === "string" ? message.author.role : "unknown";
-    const contentType = typeof message.content?.content_type === "string" ? message.content.content_type : "unknown";
-    const status = typeof message.status === "string" ? message.status : "unknown";
-    const summary = `${role} ${contentType} ${status}${message.end_turn === true ? " end_turn" : ""}`;
-    const createdAt = typeof message.create_time === "number" ? message.create_time : null;
-    const isCurrentTurn = createdAt === null || createdAt >= notBefore;
-    const isAnswer =
-      role === "assistant" &&
-      (message.recipient === undefined || message.recipient === null || message.recipient === "all") &&
-      (contentType === "text" || contentType === "multimodal_text");
-    if (!isCurrentTurn || !isAnswer || status === "in_progress" || message.end_turn === false) {
-      return { ok: true, status: response.status, state: "pending", text: null, message: summary };
+      metadata?: { is_thinking_preamble_message?: unknown; is_visually_hidden_from_conversation?: unknown };
+    };
+    const describe = (message: StoredMessage | undefined): string | null => message
+      ? [
+          String(message.author?.role),
+          String(message.content?.content_type),
+          String(message.status),
+          ...(typeof message.channel === "string" ? [message.channel] : []),
+          ...(message.end_turn === true ? ["end_turn"] : []),
+        ].join(" ")
+      : null;
+    // Pro's progress notes are commentary-channel text with end_turn false; the
+    // answer is the turn's final-channel text with end_turn true. Scan the whole
+    // turn because the current node can be a reasoning recap after the answer.
+    let answer: StoredMessage | undefined;
+    for (const node of Object.values(mapping)) {
+      const message = node?.message as StoredMessage | undefined;
+      if (!message || message.author?.role !== "assistant" || message.end_turn !== true) continue;
+      if (typeof message.create_time === "number" && message.create_time < notBefore) continue;
+      if (message.recipient !== undefined && message.recipient !== null && message.recipient !== "all") continue;
+      const contentType = message.content?.content_type;
+      if (contentType !== "text" && contentType !== "multimodal_text") continue;
+      if (message.channel === "commentary" || message.channel === "analysis") continue;
+      if (message.metadata?.is_thinking_preamble_message === true) continue;
+      if (message.metadata?.is_visually_hidden_from_conversation === true) continue;
+      const createdAt = typeof message.create_time === "number" ? message.create_time : 0;
+      const answerCreatedAt = typeof answer?.create_time === "number" ? answer.create_time : -1;
+      if (!answer || createdAt >= answerCreatedAt) answer = message;
     }
-    const parts = Array.isArray(message.content?.parts)
-      ? message.content.parts.filter((part): part is string => typeof part === "string")
+    if (!answer) {
+      const current = typeof body.current_node === "string" ? mapping[body.current_node]?.message as StoredMessage | undefined : undefined;
+      return { ok: true, status: response.status, state: "pending", text: null, message: describe(current) };
+    }
+    const summary = describe(answer);
+    const parts = Array.isArray(answer.content?.parts)
+      ? answer.content.parts.filter((part): part is string => typeof part === "string")
       : [];
     const text = parts.join("");
-    if (status !== "finished_successfully") {
+    if (answer.status === "in_progress") {
+      return { ok: true, status: response.status, state: "pending", text: null, message: summary };
+    }
+    if (answer.status !== "finished_successfully") {
       return { ok: true, status: response.status, state: "incomplete", text: null, message: summary };
     }
     if (!text.trim()) return { ok: true, status: response.status, state: "empty", text: null, message: summary };
@@ -2966,6 +2989,7 @@ function isResearchTaskFailed(status: string): boolean {
 interface ResponseParseState {
   acceptsTextContinuation: boolean;
   lastAppendText: string | null;
+  inProgressNote: boolean;
 }
 
 function mergeStreamText(current: string | null, next: string, append: boolean): string {
@@ -3024,10 +3048,12 @@ function readConversationEvent(event: unknown, state: ResponseParseState): {
       suggestions: ["Retry later or check usage limits."],
     });
   }
+  const snapshot = readEventMessage(event);
+  if (snapshot) state.inProgressNote = isProgressNote(snapshot);
   const patchText = readPatchAppendText(event, state);
   if (patchText !== null) {
     return {
-      text: patchText,
+      text: state.inProgressNote ? null : patchText,
       append: true,
       completed: event.type === "done" || event.type === "message_stream_complete",
     };
@@ -3052,11 +3078,32 @@ function parseSseFrame(frame: string): unknown {
 }
 
 function readConversationMessageText(event: Record<string, unknown>): string | null {
-  const value = event.v as { message?: unknown } | undefined;
-  const message = (event.message ?? value?.message) as { author?: unknown } | undefined;
+  const message = readEventMessage(event);
   const author = message?.author as { role?: unknown } | undefined;
-  if (author?.role !== "assistant") return null;
+  if (!message || author?.role !== "assistant" || isProgressNote(message)) return null;
   return readMessageContentText(message);
+}
+
+function readEventMessage(event: Record<string, unknown>): Record<string, unknown> | null {
+  const value = isRecord(event.v) ? event.v : null;
+  const message = event.message ?? value?.message;
+  return isRecord(message) ? message : null;
+}
+
+// Pro posts short progress notes to the user while it works ("I'm checking
+// whether..."). They are assistant text on the commentary channel, not the answer,
+// which arrives later on the final channel with end_turn set.
+function isProgressNote(message: Record<string, unknown>): boolean {
+  const author = isRecord(message.author) ? message.author : {};
+  const metadata = isRecord(message.metadata) ? message.metadata : {};
+  if (author.role !== "assistant") return false;
+  if (message.recipient !== undefined && message.recipient !== null && message.recipient !== "all") return false;
+  return (
+    message.channel === "commentary" ||
+    message.channel === "analysis" ||
+    metadata.is_thinking_preamble_message === true ||
+    metadata.is_visually_hidden_from_conversation === true
+  );
 }
 
 function readMessageContentText(message: unknown): string | null {
@@ -3119,7 +3166,7 @@ function isConversationMessageDone(event: Record<string, unknown>): boolean {
     end_turn?: unknown;
     recipient?: unknown;
   } | undefined;
-  if (message?.author?.role !== "assistant") return false;
+  if (message?.author?.role !== "assistant" || isProgressNote(message as Record<string, unknown>)) return false;
   if (message.end_turn === true) return true;
   const contentType = message.content?.content_type;
   return (

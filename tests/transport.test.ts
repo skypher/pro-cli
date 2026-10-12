@@ -1480,6 +1480,126 @@ describe("ChatGPT transport: cut-off answer streams", () => {
     });
   });
 
+  test("does not return a Pro progress note as the answer when the stream ends early", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      let answerFetches = 0;
+      const pageEvaluator = (async <T>(_base: string, script: string): Promise<T> => {
+        if (script.includes("fetchConversationAnswer")) {
+          answerFetches += 1;
+          return { ok: true, status: 200, state: "done", text: "The final answer.", message: "assistant text finished_successfully final end_turn" } as T;
+        }
+        return {
+          ok: true,
+          status: 200,
+          body: [
+            ...progressNoteFrames("conv_note", "I'm testing whether smoothing helps."),
+            'data: {"type":"message_stream_complete","conversation_id":"conv_note"}',
+            "data: [DONE]",
+            "",
+          ].join("\n\n"),
+        } as T;
+      });
+
+      const result = await runChatGptJob(job(), { sessionTokenPath, pageEvaluator, streamRecoveryPollMs: 0 });
+
+      expect(result).toBe("The final answer.");
+      expect(answerFetches).toBe(1);
+    });
+  });
+
+  test("returns only the final-channel answer after Pro progress notes", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const pageEvaluator = (async <T>(_base: string, script: string): Promise<T> => {
+        if (script.includes("fetchConversationAnswer")) throw new Error("No recovery expected.");
+        return {
+          ok: true,
+          status: 200,
+          body: [
+            ...progressNoteFrames("conv_final", "Checking the bound."),
+            'data: {"p":"","o":"add","v":{"message":{"author":{"role":"assistant"},"channel":"final","recipient":"all","content":{"content_type":"text","parts":[""]},"status":"in_progress","end_turn":null},"conversation_id":"conv_final"},"c":4}',
+            'data: {"p":"/message/content/parts/0","o":"append","v":"Final "}',
+            'data: {"v":"answer."}',
+            'data: {"p":"","o":"patch","v":[{"p":"/message/status","o":"replace","v":"finished_successfully"},{"p":"/message/end_turn","o":"replace","v":true}]}',
+            'data: {"type":"message_stream_complete","conversation_id":"conv_final"}',
+            "data: [DONE]",
+            "",
+          ].join("\n\n"),
+        } as T;
+      });
+
+      const result = await runChatGptJob(job(), { sessionTokenPath, pageEvaluator });
+
+      expect(result).toBe("Final answer.");
+    });
+  });
+
+  test("recovery finds the final answer in the stored conversation, skipping progress notes", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const now = Date.now() / 1000;
+      const stored = (withFinal: boolean) => ({
+        current_node: withFinal ? "recap" : "note",
+        mapping: {
+          user: { message: { author: { role: "user" }, content: { content_type: "text", parts: ["q"] }, status: "finished_successfully", create_time: now } },
+          old: { message: { author: { role: "assistant" }, channel: "final", recipient: "all", content: { content_type: "text", parts: ["Earlier turn."] }, status: "finished_successfully", end_turn: true, create_time: now - 3600 } },
+          note: { message: { author: { role: "assistant" }, channel: "commentary", recipient: "all", content: { content_type: "text", parts: ["I'm checking."] }, status: "finished_successfully", end_turn: false, create_time: now + 1, metadata: { is_thinking_preamble_message: true } } },
+          ...(withFinal
+            ? {
+                final: { message: { author: { role: "assistant" }, channel: "final", recipient: "all", content: { content_type: "text", parts: ["Stored ", "answer."] }, status: "finished_successfully", end_turn: true, create_time: now + 3 } },
+                recap: { message: { author: { role: "assistant" }, recipient: "all", content: { content_type: "reasoning_recap", content: "Thought for 40m" }, status: "finished_successfully", end_turn: true, create_time: now + 2 } },
+              }
+            : {}),
+        },
+      });
+      let fetches = 0;
+      const realFetch = globalThis.fetch;
+      const pageEvaluator = (async <T>(_base: string, script: string): Promise<T> => {
+        if (!script.includes("fetchConversationAnswer")) return { ok: true, status: 200, body: cutOffStream("conv_stored") } as T;
+        fetches += 1;
+        const body = stored(fetches > 1);
+        globalThis.fetch = (async (url: string | URL | Request) =>
+          String(url).endsWith("/api/auth/session")
+            ? Response.json({ accessToken: "tok" })
+            : Response.json(body)) as typeof fetch;
+        try {
+          return (await (0, eval)(script)) as T;
+        } finally {
+          globalThis.fetch = realFetch;
+        }
+      });
+
+      const result = await runChatGptJob(job(), { sessionTokenPath, pageEvaluator, streamRecoveryPollMs: 0 });
+
+      expect(result).toBe("Stored answer.");
+      expect(fetches).toBe(2);
+    });
+  });
+
+  test("stops polling for the answer when the request timeout runs out", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      let answerFetches = 0;
+      const pageEvaluator = (async <T>(_base: string, script: string): Promise<T> => {
+        if (script.includes("fetchConversationAnswer")) {
+          answerFetches += 1;
+          return { ok: true, status: 200, state: "pending", text: null, message: "assistant thoughts in_progress" } as T;
+        }
+        return { ok: true, status: 200, body: cutOffStream("conv_slow") } as T;
+      });
+
+      const started = Date.now();
+      try {
+        await runChatGptJob(job(), { sessionTokenPath, pageEvaluator, timeoutMs: 400, streamRecoveryPollMs: 50 });
+        throw new Error("Expected STREAM_INCOMPLETE.");
+      } catch (error) {
+        expect((error as ProError).code).toBe("STREAM_INCOMPLETE");
+        expect((error as ProError).details).toMatchObject({
+          recovery: { state: "timeout", message: "assistant thoughts in_progress" },
+        });
+      }
+      expect(answerFetches).toBeGreaterThan(1);
+      expect(Date.now() - started).toBeLessThan(2_000);
+    });
+  });
+
   test("reports an empty stored answer as EMPTY_RESPONSE without waiting", async () => {
     await withTokenFile(async (sessionTokenPath) => {
       const pageEvaluator = (async <T>(_base: string, script: string): Promise<T> => {
@@ -1585,6 +1705,19 @@ function cutOffStream(conversationId: string, extraFrames: string[] = []): strin
     ...extraFrames,
     "",
   ].join("\n\n");
+}
+
+// The frames of a Pro progress note: a commentary-channel assistant message whose
+// text streams in through append patches.
+function progressNoteFrames(conversationId: string, note: string): string[] {
+  return [
+    `data: {"p":"","o":"add","v":{"message":{"author":{"role":"user"},"content":{"content_type":"text","parts":["question"]},"status":"finished_successfully"},"conversation_id":${JSON.stringify(conversationId)}},"c":0}`,
+    'data: {"p":"","o":"add","v":{"message":{"author":{"role":"assistant"},"content":{"content_type":"thoughts","thoughts":[]},"status":"in_progress"}},"c":1}',
+    'data: {"p":"","o":"add","v":{"message":{"author":{"role":"assistant"},"channel":"commentary","recipient":"all","content":{"content_type":"text","parts":[""]},"status":"in_progress","end_turn":null,"metadata":{"is_thinking_preamble_message":true}}},"c":2}',
+    `data: {"p":"/message/content/parts/0","o":"append","v":${JSON.stringify(note.slice(0, 8))}}`,
+    `data: {"v":${JSON.stringify(note.slice(8))}}`,
+    'data: {"p":"","o":"patch","v":[{"p":"/message/status","o":"replace","v":"finished_successfully"}]}',
+  ];
 }
 
 function researchLaunchStream(taskId: string, acknowledgement: string): string {

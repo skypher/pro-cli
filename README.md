@@ -141,7 +141,7 @@ pro-cli job list --limit 20 --json
 
 `job wait` without a timeout waits until the job succeeds, fails, or is cancelled. Long prompts and `--reasoning extended` can run for several minutes. Use `--soft-timeout <ms>` when an agent needs to poll without a nonzero exit. Use `--wait-timeout <ms>` only when a timeout should fail the local command.
 
-ChatGPT's answer stream can end before a long Pro answer is ready, and the browser read is capped below the request timeout (30 minutes by default). In that case the job polls the ChatGPT conversation until the final answer is stored. When the stream is cut off or empty, `~/.pro-cli/diagnostics/<job-id>-stream.json` records its event structure: event types, message roles and statuses, and lengths, never prompt or answer text. The job error's `details.recovery` says what polling found.
+ChatGPT's answer stream can end before a long Pro answer is ready, and the browser read is capped below the request timeout (30 minutes by default). In that case the job polls the ChatGPT conversation until the final answer is stored, for up to 3 hours in total (or `--timeout`, when set). When the stream is cut off or empty, `~/.pro-cli/diagnostics/<job-id>-stream.json` records its event structure: event types, message roles and statuses, and lengths, never prompt or answer text. The job error's `details.recovery` says what polling found.
 
 Daemon:
 
