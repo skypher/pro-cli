@@ -60,6 +60,7 @@ export class GateError extends Error {
 
 const KEY_NAME = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const FILE_NAME = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/;
+const ERROR_CODE = /^[A-Z][A-Z0-9_]{0,63}$/;
 const JOB_ID = /^(?:job|ask)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 // Mirrors BOOLEAN_FLAGS in src/args.ts so flag values and positionals split the same way.
@@ -448,7 +449,7 @@ async function getImage(cfg: GateConfig, jobIdArg: string | undefined, fileArg: 
   for await (const chunk of Bun.file(path).stream() as unknown as AsyncIterable<Uint8Array>) await io.stdout(chunk);
 }
 
-async function runProCli(cfg: GateConfig, args: string[], io: GateIO, runner: ProCliRunner): Promise<number> {
+async function runProCli(cfg: GateConfig, args: string[], io: GateIO, runner: ProCliRunner): Promise<{ code: number; errorCode?: string }> {
   const checked = await checkProCliArgs(cfg, args);
   const result = await runner([...cfg.proCli, ...checked.argv], inboxDir(cfg), cfg.env);
   const kind = checked.command.kind;
@@ -466,7 +467,20 @@ async function runProCli(cfg: GateConfig, args: string[], io: GateIO, runner: Pr
     await io.stdout(result.stdout);
   }
   if (result.stderr) io.stderr(result.stderr);
-  return result.code;
+  return { code: result.code, errorCode: result.code === 0 ? undefined : errorCodeOf(result.stderr) };
+}
+
+/** The error code from pro-cli's JSON error line; messages can quote prompt or answer text, so they are not kept. */
+function errorCodeOf(stderr: string): string | undefined {
+  for (const line of stderr.split("\n")) {
+    try {
+      const code = (JSON.parse(line) as { error?: { code?: unknown } }).error?.code;
+      if (typeof code === "string" && ERROR_CODE.test(code)) return code;
+    } catch {
+      // not a JSON line
+    }
+  }
+  return undefined;
 }
 
 /** Command and subcommand only; prompt words never reach the audit log. */
@@ -493,6 +507,7 @@ Not available: auth, update, config, setup, doctor, conversations, daemon contro
 export async function runGate(cfg: GateConfig, commandLine: string | undefined, io: GateIO, runner: ProCliRunner): Promise<number> {
   let verb = "invalid";
   let code = 2;
+  let errorCode: string | undefined;
   try {
     if (!KEY_NAME.test(cfg.key)) throw new GateError("GATE_MISCONFIGURED", "Invalid gate key name.", 7);
     await ensureDirs(cfg);
@@ -510,7 +525,7 @@ export async function runGate(cfg: GateConfig, commandLine: string | undefined, 
         break;
       case "pro-cli":
         verb = auditVerb(words.slice(1));
-        code = await runProCli(cfg, words.slice(1), io, runner);
+        ({ code, errorCode } = await runProCli(cfg, words.slice(1), io, runner));
         break;
       case "put":
         await io.stdout(`${JSON.stringify({ ok: true, data: await putFile(cfg, argsOf(1)[0], io) })}\n`);
@@ -543,10 +558,11 @@ export async function runGate(cfg: GateConfig, commandLine: string | undefined, 
     const gateError = error instanceof GateError ? error : new GateError("GATE_INTERNAL", String((error as Error)?.message ?? error), 7);
     io.stderr(`${JSON.stringify({ ok: false, error: { code: gateError.code, message: gateError.message } })}\n`);
     code = gateError.exitCode;
+    errorCode = gateError.code;
   }
   await appendFile(
     join(stateDir(cfg), "audit.log"),
-    `${JSON.stringify({ at: new Date().toISOString(), verb: verb.slice(0, 64), code })}\n`,
+    `${JSON.stringify({ at: new Date().toISOString(), verb: verb.slice(0, 64), code, ...(errorCode ? { error: errorCode } : {}) })}\n`,
     { mode: 0o600 },
   ).catch(() => undefined);
   return code;

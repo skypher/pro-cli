@@ -64,7 +64,8 @@ async function gate(line: string | undefined, stdin: Uint8Array[] = []) {
       return nextRun;
     },
   );
-  const error = stderr ? (JSON.parse(stderr.split("\n")[0]) as { error?: { code: string } }).error?.code : undefined;
+  const first = stderr.split("\n")[0];
+  const error = first.startsWith("{") ? (JSON.parse(first) as { error?: { code: string } }).error?.code : undefined;
   return { code, stdout, stdoutBytes, stderr, error };
 }
 
@@ -381,4 +382,32 @@ test("audit log records verbs and exit codes, not prompts", async () => {
     ["pro-cli ask", 0],
     ["pro-cli auth capture", 2],
   ]);
+});
+
+test("audit log records error codes of failed calls, not messages", async () => {
+  await seedOwned(JOB_A);
+  nextRun = {
+    code: 7,
+    stdout: "",
+    stderr: `warning first\n${JSON.stringify({ ok: false, error: { code: "INTERNAL_ERROR", message: "quoted private text", suggestions: [] } })}\n`,
+  };
+  await gate(`pro-cli job wait ${JOB_A}`);
+  nextRun = { code: 7, stdout: "", stderr: `${JSON.stringify({ ok: false, error: { code: "private words", message: "x" } })}\n` };
+  await gate(`pro-cli job wait ${JOB_A}`);
+  nextRun = { code: 1, stdout: "", stderr: "Segmentation fault\n" };
+  await gate(`pro-cli job status ${JOB_A}`);
+  nextRun = { code: 0, stdout: '{"ok":true,"data":{}}\n', stderr: "" };
+  await gate(`pro-cli job wait ${JOB_A}`);
+  await gate(`pro-cli job wait ${FOREIGN}`);
+  const log = await readFile(join(cfg.stateRoot, cfg.key, "audit.log"), "utf8");
+  expect(log).not.toContain("private");
+  const lines = log.trim().split("\n").map((line) => JSON.parse(line));
+  expect(lines.map(({ verb, code, error }) => ({ verb, code, error }))).toEqual([
+    { verb: "pro-cli job wait", code: 7, error: "INTERNAL_ERROR" },
+    { verb: "pro-cli job wait", code: 7, error: undefined },
+    { verb: "pro-cli job status", code: 1, error: undefined },
+    { verb: "pro-cli job wait", code: 0, error: undefined },
+    { verb: "pro-cli job wait", code: 1, error: "JOB_NOT_FOUND" },
+  ]);
+  expect(lines[3]).not.toHaveProperty("error");
 });
