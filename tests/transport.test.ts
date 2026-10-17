@@ -1652,6 +1652,131 @@ describe("ChatGPT transport: cut-off answer streams", () => {
   });
 });
 
+describe("deleteConversation and preamble", () => {
+  function savedJob(options: Record<string, unknown>): JobRecord {
+    const base = job();
+    return { ...base, options: { ...base.options, temporary: false, ...options } };
+  }
+
+  // Routes conversation requests to `body`, answer polls to `answer`, and records chat deletions.
+  function evaluator(body: string, opts: { answer?: unknown; patchOk?: boolean } = {}) {
+    const patches: string[] = [];
+    let request = "";
+    const pageEvaluator = (async <T>(_base: string, script: string): Promise<T> => {
+      if (script.includes("is_visible")) {
+        patches.push(script);
+        return { ok: opts.patchOk ?? true, status: opts.patchOk === false ? 500 : 200 } as T;
+      }
+      if (script.includes("fetchConversationAnswer")) return opts.answer as T;
+      request = script;
+      return { ok: true, status: 200, body } as T;
+    });
+    return { pageEvaluator, patches, request: () => request };
+  }
+
+  test("deletes the new saved chat after the answer arrives", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const fake = evaluator(savedConversationStream("conv_saved", "OK"));
+      const result = await runChatGptJob(savedJob({ deleteConversation: true }), {
+        sessionTokenPath,
+        pageEvaluator: fake.pageEvaluator,
+      });
+
+      expect(result).toBe("OK");
+      expect(requestBodyFromExpression(fake.request())).not.toHaveProperty("history_and_training_disabled");
+      expect(fake.patches).toHaveLength(1);
+      expect(fake.patches[0]).toContain("conv_saved");
+      expect(fake.patches[0]).toContain('"is_visible":false');
+    });
+  });
+
+  test("keeps the chat without deleteConversation or when continuing a chat", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      for (const options of [{}, { deleteConversation: true, conversationId: "conv_old", parentMessageId: "msg_1" }]) {
+        const fake = evaluator(savedConversationStream("conv_old", "OK"));
+        expect(await runChatGptJob(savedJob(options), { sessionTokenPath, pageEvaluator: fake.pageEvaluator })).toBe("OK");
+        expect(fake.patches).toHaveLength(0);
+      }
+    });
+  });
+
+  test("deletes the chat after recovering an answer from a cut-off stream", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const fake = evaluator(cutOffStream("conv_cut"), {
+        answer: { ok: true, status: 200, state: "done", text: "Recovered answer", message: null },
+      });
+      const result = await runChatGptJob(savedJob({ deleteConversation: true }), {
+        sessionTokenPath,
+        pageEvaluator: fake.pageEvaluator,
+        streamRecoveryPollMs: 0,
+      });
+
+      expect(result).toBe("Recovered answer");
+      expect(fake.patches).toHaveLength(1);
+      expect(fake.patches[0]).toContain("conv_cut");
+    });
+  });
+
+  test("deletes the chat when the job fails", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const fake = evaluator(cutOffStream("conv_empty"), {
+        answer: { ok: true, status: 200, state: "empty", text: null, message: "assistant text finished_successfully" },
+      });
+      await expect(
+        runChatGptJob(savedJob({ deleteConversation: true }), {
+          sessionTokenPath,
+          pageEvaluator: fake.pageEvaluator,
+          streamRecoveryPollMs: 0,
+        }),
+      ).rejects.toBeInstanceOf(ProError);
+      expect(fake.patches).toHaveLength(1);
+      expect(fake.patches[0]).toContain("conv_empty");
+    });
+  });
+
+  test("logs a chat it could not delete and still returns the answer", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const diagnosticsDir = await mkdtemp(join(tmpdir(), "pro-delete-diag-"));
+      try {
+        const fake = evaluator(savedConversationStream("conv_stuck", "OK"), { patchOk: false });
+        const result = await runChatGptJob(savedJob({ deleteConversation: true }), {
+          sessionTokenPath,
+          pageEvaluator: fake.pageEvaluator,
+          diagnosticsDir,
+        });
+
+        expect(result).toBe("OK");
+        expect(fake.patches).toHaveLength(2);
+        const log = await readFile(join(diagnosticsDir, "undeleted-conversations.jsonl"), "utf8");
+        expect(JSON.parse(log.trim())).toMatchObject({ jobId: "job_test", conversationId: "conv_stuck" });
+      } finally {
+        await rm(diagnosticsDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  test("puts the preamble ahead of the instructions and the prompt", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const fake = evaluator(conversationStream("OK"));
+      await runChatGptJob(savedJob({ preamble: "Keep the account owner private." }), {
+        sessionTokenPath,
+        pageEvaluator: fake.pageEvaluator,
+      });
+
+      const messages = requestBodyFromExpression(fake.request()).messages as Array<{ content: { parts: string[] } }>;
+      expect(messages[0].content.parts[0]).toBe("Keep the account owner private.\n\nUse terse answers.\n\nReply with OK only.");
+    });
+  });
+});
+
+function savedConversationStream(conversationId: string, text: string): string {
+  return [
+    `data: {"message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":[${JSON.stringify(text)}]},"status":"finished_successfully"},"conversation_id":${JSON.stringify(conversationId)}}`,
+    "data: [DONE]",
+    "",
+  ].join("\n\n");
+}
+
 function job(patch: Partial<Pick<JobRecord, "model" | "reasoning">> = {}): JobRecord {
   const now = new Date().toISOString();
   return {

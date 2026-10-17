@@ -20,7 +20,6 @@ beforeEach(async () => {
     key: "tester",
     inboxRoot: join(root, "inbox"),
     stateRoot: join(root, "state"),
-    imagesRoot: join(root, "images"),
     proCli: ["/fake/bun", "/fake/cli.ts"],
     env: { HOME: "/fake-home", PATH: "/usr/bin" },
     maxUploadBytes: 1024,
@@ -165,6 +164,8 @@ describe("gate commands", () => {
       "--store true",
       "--no-temporary",
       "--keep-conversation",
+      "--delete-conversation",
+      "--preamble hi",
       "--no-json",
       "--no-start",
       "--out /tmp/x",
@@ -183,7 +184,7 @@ describe("gate commands", () => {
     const result = await gate("pro-cli ask --model gpt-5-5 'what is 2+2' -- --cdp=x");
     expect(result.code).toBe(0);
     expect(calls).toHaveLength(1);
-    expect(calls[0].argv).toEqual(["/fake/bun", "/fake/cli.ts", "ask", "--model=gpt-5-5", "--json", "--", "what is 2+2", "--cdp=x"]);
+    expect(calls[0].argv).toEqual(["/fake/bun", "/fake/cli.ts", "ask", "--model=gpt-5-5", "--chat-only", "--json", "--", "what is 2+2", "--cdp=x"]);
     expect(calls[0].cwd).toBe(inbox());
     expect(calls[0].env).toEqual(cfg.env);
 
@@ -191,6 +192,48 @@ describe("gate commands", () => {
     expect(calls[1].argv).toEqual(["/fake/bun", "/fake/cli.ts", "limits", "--json"]);
     await gate("pro-cli daemon status");
     expect(calls[2].argv).toEqual(["/fake/bun", "/fake/cli.ts", "daemon", "status", "--json"]);
+  });
+});
+
+describe("--github", () => {
+  const preambleArg = (argv: string[]) => argv.find((arg) => arg.startsWith("--preamble=")) ?? "";
+
+  test("runs job create and ask as a saved chat with the preamble, deleted afterwards", async () => {
+    expect((await gate("pro-cli job create --github --model gpt-6-pro 'read owner/repo'")).code).toBe(0);
+    expect(calls[0].argv.slice(2)).toEqual([
+      "job",
+      "create",
+      "--model=gpt-6-pro",
+      "--save",
+      "--delete-conversation",
+      preambleArg(calls[0].argv),
+      "--chat-only",
+      "--json",
+      "--",
+      "read owner/repo",
+    ]);
+    expect(preambleArg(calls[0].argv)).toContain("not from the account owner");
+    expect(preambleArg(calls[0].argv)).toContain("GitHub connector");
+
+    expect((await gate("pro-cli ask --github hello")).code).toBe(0);
+    expect(calls[1].argv).toContain("--save");
+    expect(calls[1].argv).toContain("--delete-conversation");
+    expect(calls[1].argv).not.toContain("--github");
+  });
+
+  test("is refused with --temporary, with a value, and for odds", async () => {
+    expect((await gate("pro-cli job create --github --temporary hello")).error).toBe("BAD_ARGS");
+    expect((await gate("pro-cli ask --github=yes hello")).error).toBe("BAD_ARGS");
+    expect((await gate("pro-cli odds --github 'will it rain'")).error).toBe("FLAG_DENIED");
+    expect(calls).toHaveLength(0);
+  });
+
+  test("is marked in the audit log", async () => {
+    await gate("pro-cli job create --github hello");
+    await gate("pro-cli job create hello");
+    const lines = (await readFile(join(cfg.stateRoot, cfg.key, "audit.log"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    expect(lines[0]).toMatchObject({ verb: "pro-cli job create", code: 0, github: true });
+    expect(lines[1]).not.toHaveProperty("github");
   });
 });
 
@@ -288,15 +331,11 @@ describe("job ownership", () => {
     expect(owned).toEqual([JOB_A, JOB_B, FOREIGN.replace("9999", "3333")]);
   });
 
-  test("records ephemeral ask ids so ask images can be downloaded", async () => {
+  test("records ephemeral ask ids", async () => {
     const askId = "ask_33333333-3333-4333-8333-333333333333";
     nextRun = { code: 0, stdout: JSON.stringify({ ok: true, data: { job: { id: askId } } }), stderr: "" };
-    await gate("pro-cli ask --model image 'a cat'");
-    await mkdir(join(cfg.imagesRoot, askId), { recursive: true });
-    await writeFile(join(cfg.imagesRoot, askId, "image-1.png"), "IMG");
-    const result = await gate(`get ${askId} image-1.png`);
-    expect(result.code).toBe(0);
-    expect(result.stdout).toBe("IMG");
+    await gate("pro-cli ask 'a cat'");
+    expect(await readFile(join(cfg.stateRoot, cfg.key, "jobs"), "utf8")).toBe(`${askId}\n`);
   });
 
   test("job list only shows owned jobs", async () => {
@@ -351,24 +390,18 @@ describe("inbox verbs", () => {
   });
 });
 
-describe("get", () => {
-  beforeEach(async () => {
-    await mkdir(join(cfg.imagesRoot, JOB_A), { recursive: true });
-    await mkdir(join(cfg.imagesRoot, FOREIGN), { recursive: true });
-    await writeFile(join(cfg.imagesRoot, JOB_A, "image-1.png"), new Uint8Array([0x89, 0x50, 0x4e, 0x47]));
-    await writeFile(join(cfg.imagesRoot, FOREIGN, "image-1.png"), "OTHER");
-    await symlink(join(root, "secret", "token.json"), join(cfg.imagesRoot, JOB_A, "image-2.png"));
-    await seedOwned(JOB_A);
+describe("chat models only", () => {
+  test("ask, odds and job create always carry --chat-only", async () => {
+    for (const line of ["pro-cli ask --model image 'a cat'", "pro-cli odds 'will it rain'", "pro-cli job create --model deep-research hello"]) {
+      await gate(line);
+    }
+    expect(calls.map((call) => call.argv.includes("--chat-only"))).toEqual([true, true, true]);
+    await gate("pro-cli job list");
+    expect(calls[3].argv).not.toContain("--chat-only");
   });
 
-  test("streams images of owned jobs only", async () => {
-    const ok = await gate(`get ${JOB_A} image-1.png`);
-    expect(ok.code).toBe(0);
-    expect(Buffer.concat(ok.stdoutBytes)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
-    expect((await gate(`get ${FOREIGN} image-1.png`)).error).toBe("JOB_NOT_FOUND");
-    expect((await gate(`get ${JOB_A} image-2.png`)).error).toBe("FILE_NOT_FOUND");
-    expect((await gate(`get ${JOB_A} ../${FOREIGN}/image-1.png`)).error).toBe("BAD_FILE_NAME");
-    expect((await gate("get ../../secret token.json")).error).toBe("BAD_JOB_ID");
+  test("get is not a command", async () => {
+    expect((await gate(`get ${JOB_A} image-1.png`)).error).toBe("COMMAND_DENIED");
   });
 });
 

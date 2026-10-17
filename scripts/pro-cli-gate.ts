@@ -10,11 +10,10 @@
 // Each <key> gets its own inbox (~/pro-cli-inbox/<key>), job list and audit log (~/.local/state/pro-cli-gate/<key>).
 //
 // Client verbs (SSH_ORIGINAL_COMMAND):
-//   pro-cli <ask|odds|job|models|limits|daemon status> ...   output is always JSON
+//   pro-cli <ask|odds|job|models|limits|daemon status> ...   output is always JSON; chat models only
 //   put <name>          upload stdin into the inbox
 //   ls                  list inbox files
 //   rm <name>           delete an inbox file
-//   get <jobId> <file>  download a generated image of an owned job
 //   help
 
 import { randomBytes } from "node:crypto";
@@ -26,7 +25,6 @@ export interface GateConfig {
   key: string;
   inboxRoot: string;
   stateRoot: string;
-  imagesRoot: string;
   proCli: string[];
   env: Record<string, string>;
   maxUploadBytes: number;
@@ -74,6 +72,8 @@ const BOOLEAN_FLAGS = new Set([
   "temporary",
   "no-temporary",
   "keep-conversation",
+  "delete-conversation",
+  "chat-only",
   "wait",
   "help",
   "version",
@@ -82,7 +82,18 @@ const BOOLEAN_FLAGS = new Set([
   "no-backup",
   "force",
   "legacy",
+  "github",
 ]);
+
+// Gate-only flag for ask and job create. ChatGPT turns connectors off in temporary chats,
+// so --github runs the request as a saved chat, puts GITHUB_PREAMBLE ahead of it, and has
+// pro-cli delete the chat when the job ends. The preamble asks the model to keep the account
+// owner's memory and custom instructions out of the answer; it is a request, not a guarantee.
+const GITHUB_PREAMBLE =
+  "This request comes from a collaborator using this account through an automated tool, not from the account owner. " +
+  "Do not use, mention, or reveal anything about the account owner that comes from memory, custom instructions, or earlier chats. " +
+  "Base the answer only on this request and the sources you consult for it. " +
+  "If it involves a GitHub repository, read it with the GitHub connector.";
 
 const REQUEST_FLAGS = [
   "json",
@@ -99,6 +110,7 @@ const REQUEST_FLAGS = [
 ];
 const ASK_FLAGS = new Set([
   ...REQUEST_FLAGS,
+  "github",
   "instructions",
   "instructions-file",
   "condensed-response",
@@ -300,7 +312,10 @@ async function requireInboxFile(cfg: GateConfig, name: string): Promise<void> {
 }
 
 /** Validates pro-cli argv against the allowlist; returns the argv to execute. */
-export async function checkProCliArgs(cfg: GateConfig, args: string[]): Promise<{ argv: string[]; command: ProCommand; jobId?: string }> {
+export async function checkProCliArgs(
+  cfg: GateConfig,
+  args: string[],
+): Promise<{ argv: string[]; command: ProCommand; jobId?: string; github: boolean }> {
   const [command, maybeSub] = args;
   if (!command) throw new GateError("COMMAND_DENIED", "Missing pro-cli command.");
   const subcommand = maybeSub !== undefined && !maybeSub.startsWith("--") && (command === "job" || command === "daemon") ? maybeSub : undefined;
@@ -321,6 +336,16 @@ export async function checkProCliArgs(cfg: GateConfig, args: string[]): Promise<
     }
   }
 
+  const github = parsed.flags.some((flag) => flag.name === "github");
+  if (github) {
+    if (parsed.flags.some((flag) => flag.name === "github" && flag.value !== true)) {
+      throw new GateError("BAD_ARGS", "--github takes no value.");
+    }
+    if (parsed.flags.some((flag) => flag.name === "temporary")) {
+      throw new GateError("BAD_ARGS", "--github runs a saved chat, because connectors are off in temporary chats; drop --temporary.");
+    }
+  }
+
   let jobId: string | undefined;
   if (spec.kind === "ask" || spec.kind === "odds" || spec.kind === "job create") {
     const prompt = parsed.positionals.join(" ").trim();
@@ -336,9 +361,12 @@ export async function checkProCliArgs(cfg: GateConfig, args: string[]): Promise<
   // Rebuild argv from the parsed form so the child sees exactly what was checked.
   const argv = [command, ...(subcommand === undefined ? [] : [subcommand])];
   for (const flag of parsed.flags) {
-    if (flag.name === "json") continue;
+    if (flag.name === "json" || flag.name === "github") continue;
     argv.push(flag.value === true ? `--${flag.name}` : `--${flag.name}=${flag.value}`);
   }
+  if (github) argv.push("--save", "--delete-conversation", `--preamble=${GITHUB_PREAMBLE}`);
+  // Deep Research and image generation are not offered through the gate.
+  if (spec.kind === "ask" || spec.kind === "odds" || spec.kind === "job create") argv.push("--chat-only");
   argv.push("--json");
   if (spec.kind === "job list") {
     // Fetch the newest jobs and filter to this key afterwards.
@@ -347,7 +375,7 @@ export async function checkProCliArgs(cfg: GateConfig, args: string[]): Promise<
     argv.push("--limit=200");
   }
   if (parsed.positionals.length > 0) argv.push("--", ...parsed.positionals);
-  return { argv, command: spec, jobId };
+  return { argv, command: spec, jobId, github };
 }
 
 function inboxDir(cfg: GateConfig): string {
@@ -437,19 +465,12 @@ async function putFile(cfg: GateConfig, name: string, io: GateIO): Promise<Recor
   return { name, bytes };
 }
 
-async function getImage(cfg: GateConfig, jobIdArg: string | undefined, fileArg: string | undefined, io: GateIO): Promise<void> {
-  const jobId = validateJobId(jobIdArg);
-  const file = validateFileName(fileArg);
-  if (!(await ownedJobs(cfg)).has(jobId)) throw new GateError("JOB_NOT_FOUND", `No job ${jobId} for this key.`, 1);
-  const dir = join(cfg.imagesRoot, jobId);
-  const path = join(dir, file);
-  const stats = await lstat(path).catch(() => null);
-  if (!stats?.isFile()) throw new GateError("FILE_NOT_FOUND", `No file ${file} for job ${jobId}.`, 1);
-  if ((await realpath(path)) !== join(await realpath(dir), file)) throw new GateError("FILE_NOT_FOUND", `No file ${file} for job ${jobId}.`, 1);
-  for await (const chunk of Bun.file(path).stream() as unknown as AsyncIterable<Uint8Array>) await io.stdout(chunk);
-}
-
-async function runProCli(cfg: GateConfig, args: string[], io: GateIO, runner: ProCliRunner): Promise<{ code: number; errorCode?: string }> {
+async function runProCli(
+  cfg: GateConfig,
+  args: string[],
+  io: GateIO,
+  runner: ProCliRunner,
+): Promise<{ code: number; errorCode?: string; github: boolean }> {
   const checked = await checkProCliArgs(cfg, args);
   const result = await runner([...cfg.proCli, ...checked.argv], inboxDir(cfg), cfg.env);
   const kind = checked.command.kind;
@@ -467,7 +488,7 @@ async function runProCli(cfg: GateConfig, args: string[], io: GateIO, runner: Pr
     await io.stdout(result.stdout);
   }
   if (result.stderr) io.stderr(result.stderr);
-  return { code: result.code, errorCode: result.code === 0 ? undefined : errorCodeOf(result.stderr) };
+  return { code: result.code, errorCode: result.code === 0 ? undefined : errorCodeOf(result.stderr), github: checked.github };
 }
 
 /** The error code from pro-cli's JSON error line; messages can quote prompt or answer text, so they are not kept. */
@@ -495,11 +516,13 @@ const HELP = `pro-cli gate. Commands:
   pro-cli ask|odds ...                 query ChatGPT (output is JSON)
   pro-cli job create|status|result|wait|cancel|list ...
   pro-cli models | limits | daemon status
+  --github (ask, job create)           let Pro read GitHub repos through the account's GitHub
+                                       connector; runs as a saved chat that is deleted afterwards
   put <name> < file                    upload into your inbox
   ls                                   list inbox files
   rm <name>                            delete an inbox file
-  get <jobId> <file> > file            download a generated image
 Files for --attach, --instructions-file and @name must be uploaded with put first.
+Chat models only: Deep Research and image generation are not available.
 Not available: auth, update, config, setup, doctor, conversations, daemon control,
 --cdp, --port, --conversation, --parent, --save, --store, --no-temporary, --keep-conversation.
 `;
@@ -508,6 +531,7 @@ export async function runGate(cfg: GateConfig, commandLine: string | undefined, 
   let verb = "invalid";
   let code = 2;
   let errorCode: string | undefined;
+  let github = false;
   try {
     if (!KEY_NAME.test(cfg.key)) throw new GateError("GATE_MISCONFIGURED", "Invalid gate key name.", 7);
     await ensureDirs(cfg);
@@ -525,7 +549,7 @@ export async function runGate(cfg: GateConfig, commandLine: string | undefined, 
         break;
       case "pro-cli":
         verb = auditVerb(words.slice(1));
-        ({ code, errorCode } = await runProCli(cfg, words.slice(1), io, runner));
+        ({ code, errorCode, github } = await runProCli(cfg, words.slice(1), io, runner));
         break;
       case "put":
         await io.stdout(`${JSON.stringify({ ok: true, data: await putFile(cfg, argsOf(1)[0], io) })}\n`);
@@ -545,12 +569,6 @@ export async function runGate(cfg: GateConfig, commandLine: string | undefined, 
         code = 0;
         break;
       }
-      case "get": {
-        const [jobId, file] = argsOf(2);
-        await getImage(cfg, jobId, file, io);
-        code = 0;
-        break;
-      }
       default:
         throw new GateError("COMMAND_DENIED", `Unknown command ${JSON.stringify(verb)}.\n${HELP}`);
     }
@@ -562,7 +580,13 @@ export async function runGate(cfg: GateConfig, commandLine: string | undefined, 
   }
   await appendFile(
     join(stateDir(cfg), "audit.log"),
-    `${JSON.stringify({ at: new Date().toISOString(), verb: verb.slice(0, 64), code, ...(errorCode ? { error: errorCode } : {}) })}\n`,
+    `${JSON.stringify({
+      at: new Date().toISOString(),
+      verb: verb.slice(0, 64),
+      code,
+      ...(errorCode ? { error: errorCode } : {}),
+      ...(github ? { github: true } : {}),
+    })}\n`,
     { mode: 0o600 },
   ).catch(() => undefined);
   return code;
@@ -581,7 +605,6 @@ if (import.meta.main) {
     key: process.argv[2] ?? "",
     inboxRoot: join(home, "pro-cli-inbox"),
     stateRoot: join(home, ".local", "state", "pro-cli-gate"),
-    imagesRoot: join(home, ".pro-cli", "images"),
     proCli: [bun, join(home, "pro-cli", "src", "cli.ts")],
     env: { HOME: home, PATH: `${join(home, ".bun", "bin")}:/usr/local/bin:/usr/bin:/bin`, LANG: "C.UTF-8" },
     maxUploadBytes: 50 * 1024 * 1024,

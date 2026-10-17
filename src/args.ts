@@ -15,6 +15,8 @@ const BOOLEAN_FLAGS = new Set([
   "temporary",
   "no-temporary",
   "keep-conversation",
+  "delete-conversation",
+  "chat-only",
   "wait",
   "help",
   "version",

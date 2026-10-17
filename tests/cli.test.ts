@@ -640,6 +640,68 @@ describe("robot-mode CLI", () => {
     });
   });
 
+  test("job create --delete-conversation keeps a saved chat for deletion and stores the preamble", async () => {
+    await withHome(async (home) => {
+      const result = await run(
+        ["job", "create", "hello", "--no-start", "--save", "--delete-conversation", "--preamble", "Be discreet.", "--json"],
+        { tty: true, home },
+      );
+
+      expect(result.code).toBe(0);
+      expect(JSON.parse(result.stdout).data.job.options).toMatchObject({
+        temporary: false,
+        deleteConversation: true,
+        preamble: "Be discreet.",
+      });
+    });
+  });
+
+  test("--chat-only refuses Deep Research and image models under any alias", async () => {
+    await withHome(async (home) => {
+      for (const [command, model] of [
+        [["job", "create"], "deep-research"],
+        [["job", "create"], "Deep Research"],
+        [["job", "create"], "image"],
+        [["job", "create"], "image generation"],
+        [["ask"], "research"],
+        [["odds"], "images"],
+      ] as Array<[string[], string]>) {
+        const result = await run([...command, "hello", "--no-start", "--chat-only", "--model", model, "--json"].filter(
+          (arg) => command[0] === "job" || arg !== "--no-start",
+        ), { tty: true, home });
+        expect(result.code).toBe(2);
+        const payload = JSON.parse(result.stderr);
+        expect(payload.error.code).toBe("INVALID_ARGS");
+        expect(payload.error.message).toContain("only chat models are");
+      }
+
+      const chat = await run(["job", "create", "hello", "--no-start", "--chat-only", "--json"], { tty: true, home });
+      expect(chat.code).toBe(0);
+    });
+  });
+
+  test("rejects --delete-conversation unless it deletes a new saved chat-model chat", async () => {
+    await withHome(async (home) => {
+      const cases: Array<[string[], string]> = [
+        [["--delete-conversation"], "--delete-conversation needs a saved chat"],
+        [["--delete-conversation", "--temporary"], "--delete-conversation needs a saved chat"],
+        [["--delete-conversation", "--model", "image"], "--delete-conversation does not apply to --model image"],
+        [["--delete-conversation", "--model", "deep-research"], "--delete-conversation does not apply to --model research"],
+        [
+          ["--delete-conversation", "--conversation", "conv_1", "--parent", "msg_1"],
+          "--delete-conversation cannot be combined with --conversation",
+        ],
+      ];
+      for (const [flags, message] of cases) {
+        const result = await run(["job", "create", "hello", "--no-start", ...flags, "--json"], { tty: true, home });
+        expect(result.code).toBe(2);
+        const payload = JSON.parse(result.stderr);
+        expect(payload.error.code).toBe("INVALID_ARGS");
+        expect(payload.error.message).toContain(message);
+      }
+    });
+  });
+
   test("rejects Deep Research timeout values below thirty minutes", async () => {
     await withHome(async (home) => {
       const result = await run(

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { evaluateInCdpPage, recoverCookieBloatInCdp } from "./cdp";
 import { chatGptOrigins } from "./cookies";
@@ -250,80 +250,86 @@ async function postChatGptJob(
     }
 
     const model = canonicalModelId(job.model);
-    let parsed: ParsedConversationResponse;
+    const deleteAfter =
+      job.options.deleteConversation === true && model !== "image" && model !== "research" && !continuedConversation(job);
     try {
-      parsed = readResponse(browserResult.body, options.onLimits, {
-        allowEmptyWithConversation: model === "image",
-      });
-    } catch (error) {
-      if (!(error instanceof ProError) || !isRecoverableStreamError(error) || model === "image" || model === "research") {
-        throw error;
-      }
-      return await recoverConversationAnswer(job, error, browserResult.body, {
-        evaluate,
-        cdpBase,
-        requestStartedAt,
-        timeoutMs,
-        options,
-      });
-    }
-    if (model === "image") {
-      if (parsed.text.toLowerCase().includes("image generation isn") && parsed.text.toLowerCase().includes("temporary chat")) {
-        throw new ProError("IMAGE_TEMPORARY_UNAVAILABLE", "ChatGPT image generation is not available in temporary chats.", {
-          exitCode: EXIT.upstream,
-          suggestions: ["Use a saved ChatGPT conversation for image generation; omit --temporary."],
-          details: { preview: parsed.text.slice(0, 240), conversationId: parsed.conversationId },
+      let parsed: ParsedConversationResponse;
+      try {
+        parsed = readResponse(browserResult.body, options.onLimits, {
+          allowEmptyWithConversation: model === "image",
+        });
+      } catch (error) {
+        if (!(error instanceof ProError) || !isRecoverableStreamError(error) || model === "image" || model === "research") {
+          throw error;
+        }
+        return await recoverConversationAnswer(job, error, browserResult.body, {
+          evaluate,
+          cdpBase,
+          requestStartedAt,
+          timeoutMs,
+          options,
         });
       }
-      if (!parsed.conversationId) {
-        throw new ProError("IMAGE_CONVERSATION_MISSING", "ChatGPT did not return a conversation id for image generation.", {
-          exitCode: EXIT.upstream,
-          suggestions: ["Retry only if the user still needs a new real image generation."],
-          details: { preview: parsed.text.slice(0, 240) },
-        });
-      }
-      await options.onResearchTask?.({
-        taskId: imageTaskId(parsed.conversationId),
-        title: "Image generation",
-        conversationId: parsed.conversationId,
-      });
-      return await waitForImageResult(parsed.conversationId, evaluate, cdpBase, timeoutMs, options, {
-        jobId: job.id,
-        prompt: job.prompt,
-        initialText: parsed.text,
-        ...(baselineImageFileIds.size > 0 ? { excludeFileIds: baselineImageFileIds } : {}),
-      });
-    }
-    if (model === "research") {
-      const asyncTask = parsed.deepResearchWidget
-        ?? parsed.asyncTask
-        ?? (isDeepResearchAppToolCall(parsed.text) && parsed.conversationId
-          ? await waitForResearchWidgetFromConversation(parsed.conversationId, evaluate, cdpBase)
-          : null)
-        ?? (isIncompleteResearchAcknowledgement(parsed.text) && parsed.conversationId
-          ? await waitForResearchTaskFromConversation(parsed.conversationId, evaluate, cdpBase)
-          : null);
-      if (asyncTask?.taskId) {
-        await options.onResearchTask?.(asyncTask);
-        return await waitForResearchTask(asyncTask, evaluate, cdpBase, timeoutMs, options);
-      }
-      if (isDeepResearchAppToolCall(parsed.text)) {
-        throw new ProError(
-          "RESEARCH_WIDGET_UNAVAILABLE",
-          "Deep Research started the connector widget but pro-cli could not find its widget session.",
-          {
+      if (model === "image") {
+        if (parsed.text.toLowerCase().includes("image generation isn") && parsed.text.toLowerCase().includes("temporary chat")) {
+          throw new ProError("IMAGE_TEMPORARY_UNAVAILABLE", "ChatGPT image generation is not available in temporary chats.", {
             exitCode: EXIT.upstream,
-            suggestions: [
-              "Open the saved ChatGPT conversation to inspect the Deep Research widget.",
-              "Retry only if the user still needs a new real Deep Research run; every retry may spend Pro quota.",
-            ],
-            details: { conversationId: parsed.conversationId, preview: parsed.text.slice(0, 240) },
-          },
-        );
+            suggestions: ["Use a saved ChatGPT conversation for image generation; omit --temporary."],
+            details: { preview: parsed.text.slice(0, 240), conversationId: parsed.conversationId },
+          });
+        }
+        if (!parsed.conversationId) {
+          throw new ProError("IMAGE_CONVERSATION_MISSING", "ChatGPT did not return a conversation id for image generation.", {
+            exitCode: EXIT.upstream,
+            suggestions: ["Retry only if the user still needs a new real image generation."],
+            details: { preview: parsed.text.slice(0, 240) },
+          });
+        }
+        await options.onResearchTask?.({
+          taskId: imageTaskId(parsed.conversationId),
+          title: "Image generation",
+          conversationId: parsed.conversationId,
+        });
+        return await waitForImageResult(parsed.conversationId, evaluate, cdpBase, timeoutMs, options, {
+          jobId: job.id,
+          prompt: job.prompt,
+          initialText: parsed.text,
+          ...(baselineImageFileIds.size > 0 ? { excludeFileIds: baselineImageFileIds } : {}),
+        });
       }
+      if (model === "research") {
+        const asyncTask = parsed.deepResearchWidget
+          ?? parsed.asyncTask
+          ?? (isDeepResearchAppToolCall(parsed.text) && parsed.conversationId
+            ? await waitForResearchWidgetFromConversation(parsed.conversationId, evaluate, cdpBase)
+            : null)
+          ?? (isIncompleteResearchAcknowledgement(parsed.text) && parsed.conversationId
+            ? await waitForResearchTaskFromConversation(parsed.conversationId, evaluate, cdpBase)
+            : null);
+        if (asyncTask?.taskId) {
+          await options.onResearchTask?.(asyncTask);
+          return await waitForResearchTask(asyncTask, evaluate, cdpBase, timeoutMs, options);
+        }
+        if (isDeepResearchAppToolCall(parsed.text)) {
+          throw new ProError(
+            "RESEARCH_WIDGET_UNAVAILABLE",
+            "Deep Research started the connector widget but pro-cli could not find its widget session.",
+            {
+              exitCode: EXIT.upstream,
+              suggestions: [
+                "Open the saved ChatGPT conversation to inspect the Deep Research widget.",
+                "Retry only if the user still needs a new real Deep Research run; every retry may spend Pro quota.",
+              ],
+              details: { conversationId: parsed.conversationId, preview: parsed.text.slice(0, 240) },
+            },
+          );
+        }
+      }
+      validateCompletedResult(job, parsed.text);
+      return parsed.text;
+    } finally {
+      if (deleteAfter) await deleteJobConversation(job, browserResult.body, evaluate, cdpBase, options);
     }
-    validateCompletedResult(job, parsed.text);
-    return parsed.text;
   } catch (error) {
     if (error instanceof ProError) throw error;
     throw networkError(error);
@@ -1078,7 +1084,10 @@ function buildRequestBody(job: JobRecord, attachments: UploadedAttachment[] = []
   const requestedModel = canonicalModelId(job.model);
   const isResearch = requestedModel === "research";
   const isImage = requestedModel === "image";
-  const prompt = isResearch ? buildResearchPrompt(job) : isImage ? buildImagePrompt(job) : buildConversationPrompt(job);
+  const prompt = withPreamble(
+    job,
+    isResearch ? buildResearchPrompt(job) : isImage ? buildImagePrompt(job) : buildConversationPrompt(job),
+  );
   const model = isResearch ? DEEP_RESEARCH_ROUTER_MODEL : isImage ? DEFAULT_MODEL : normalizeModel(job.model);
   const thinkingEffort = !isResearch && modelUsesThinkingEffort(model) ? normalizeReasoning(job.reasoning) : undefined;
   const conversationId = stringOption(job.options.conversationId);
@@ -1175,6 +1184,12 @@ function deepResearchMessageMetadata(): Record<string, unknown> {
     venus_model_variant: "standard",
     serialization_metadata: { custom_symbol_offsets: [] },
   };
+}
+
+/** --preamble text goes ahead of the instructions and the prompt. */
+function withPreamble(job: JobRecord, prompt: string): string {
+  const preamble = stringOption(job.options.preamble)?.trim();
+  return preamble ? `${preamble}\n\n${prompt}` : prompt;
 }
 
 function buildResearchPrompt(job: JobRecord): string {
@@ -1403,6 +1418,44 @@ function describeStreamMessage(message: Record<string, unknown>): string {
     ...(typeof finishDetails.type === "string" ? [`finish=${finishDetails.type}`] : []),
   ];
   return fields.join(" ");
+}
+
+function continuedConversation(job: JobRecord): boolean {
+  return stringOption(job.options.conversationId) !== undefined;
+}
+
+/**
+ * Deletes the saved chat a --delete-conversation job created, as the ChatGPT UI does
+ * (is_visible: false). Never throws: a chat that stays undeleted is logged to
+ * undeleted-conversations.jsonl in the diagnostics dir instead of failing the job.
+ */
+async function deleteJobConversation(
+  job: JobRecord,
+  rawStream: string,
+  evaluate: PageEvaluator,
+  cdpBase: string,
+  options: TransportOptions,
+): Promise<void> {
+  const conversationId = summarizeConversationStream(rawStream).conversationId;
+  if (!conversationId) return;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const deleted = await evaluate<BrowserConversationPatchResult>(
+      cdpBase,
+      buildConversationPatchExpression(conversationId, { is_visible: false }),
+      30_000,
+    ).then((patch) => patch.ok === true).catch(() => false);
+    if (deleted) return;
+  }
+  if (!options.diagnosticsDir) return;
+  try {
+    await mkdir(options.diagnosticsDir, { recursive: true, mode: 0o700 });
+    const record = { jobId: job.id, conversationId, recordedAt: new Date().toISOString() };
+    await appendFile(join(options.diagnosticsDir, "undeleted-conversations.jsonl"), `${JSON.stringify(record)}\n`, {
+      mode: 0o600,
+    });
+  } catch {
+    // best effort; the job result matters more than this record
+  }
 }
 
 async function writeStreamDiagnostics(

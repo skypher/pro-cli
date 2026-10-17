@@ -220,7 +220,9 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
         const askModel = resolveModel(flagString(parsed.flags, "model") ?? config.defaultModel ?? DEFAULT_MODEL);
         const askReasoning = resolveRequestReasoning(askModel, parsed.flags, config.defaultReasoning);
         const askOptions = await collectRequestOptions(parsed.flags, io.cwd, ASK_REQUEST_FLAGS, "ask");
+        rejectNonChatModel(parsed.flags, askModel);
         applyModelConversationRequirements(askOptions, parsed.flags, askModel);
+        validateConversationDeletion(askOptions, askModel);
         applyModelTimeoutDefaults(askOptions, parsed.flags, askModel);
         const schemaRaw = flagString(parsed.flags, "schema");
         const formatHint = flagString(parsed.flags, "format");
@@ -293,6 +295,7 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
           "odds",
         );
         const oddsModel = resolveModel(flagString(parsed.flags, "model") ?? config.defaultModel ?? DEFAULT_MODEL);
+        rejectNonChatModel(parsed.flags, oddsModel);
         applyModelConversationRequirements(baseRequestOptions, parsed.flags, oddsModel);
         applyModelTimeoutDefaults(baseRequestOptions, parsed.flags, oddsModel);
         const result = await runOdds({
@@ -352,7 +355,9 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
           const userPrompt = await promptFromArgs(rest, io.cwd);
           const jobModel = resolveModel(flagString(parsed.flags, "model") ?? config.defaultModel ?? DEFAULT_MODEL);
           const jobOptions = await collectRequestOptions(parsed.flags, io.cwd, JOB_CREATE_FLAGS, "job create");
+          rejectNonChatModel(parsed.flags, jobModel);
           applyModelConversationRequirements(jobOptions, parsed.flags, jobModel);
+          validateConversationDeletion(jobOptions, jobModel);
           applyModelTimeoutDefaults(jobOptions, parsed.flags, jobModel);
           const input = {
             prompt: userPrompt,
@@ -798,6 +803,9 @@ async function collectRequestOptions(
   setBooleanOption(options, "parallelTools", flags, "parallel-tools");
   setConversationOptions(options, flags);
   if (flagBoolean(flags, "keep-conversation")) options.keepConversation = true;
+  if (flagBoolean(flags, "delete-conversation")) options.deleteConversation = true;
+  const preamble = flagString(flags, "preamble");
+  if (preamble?.trim()) options.preamble = preamble.trim();
   const attachPaths = flagStrings(flags, "attach");
   if (attachPaths.length > 0) {
     options.attachments = await resolveAttachments(attachPaths, cwd);
@@ -877,6 +885,9 @@ const ASK_REQUEST_FLAGS = new Set([
   "parent",
   "attach",
   "keep-conversation",
+  "delete-conversation",
+  "preamble",
+  "chat-only",
   "cdp",
   "port",
   "schema",
@@ -918,6 +929,7 @@ const ODDS_REQUEST_FLAGS = new Set([
   "aggregate",
   "parse-retries",
   "allow-fifty",
+  "chat-only",
 ]);
 
 function resolveAggregate(value: string): AggregateMethod {
@@ -1004,6 +1016,37 @@ function applyModelConversationRequirements(
     ]);
   }
   if (!options.conversationId) options.temporary = false;
+}
+
+/** --chat-only limits a request to chat models, refusing Deep Research and image generation. */
+function rejectNonChatModel(flags: Map<string, string | boolean | string[]>, model: string): void {
+  if (!flagBoolean(flags, "chat-only") || !modelRequiresSavedConversation(model)) return;
+  throw invalidArgs(`--model ${canonicalModelId(model)} is not available here; only chat models are.`, [
+    "Pick a chat model from pro-cli models.",
+  ]);
+}
+
+/** --delete-conversation removes the new saved chat a chat-model job creates, once the job ends. */
+function validateConversationDeletion(options: Record<string, unknown>, model: string): void {
+  if (options.deleteConversation !== true) return;
+  const canonical = canonicalModelId(model);
+  if (canonical === "image" || canonical === "research") {
+    throw invalidArgs(`--delete-conversation does not apply to --model ${canonical}.`, [
+      canonical === "image"
+        ? "Image jobs already delete their chat unless --keep-conversation is given."
+        : "Deep Research keeps its chat; omit --delete-conversation.",
+    ]);
+  }
+  if (options.conversationId) {
+    throw invalidArgs("--delete-conversation cannot be combined with --conversation.", [
+      "It only deletes the new chat a job creates; continuing an existing chat would delete that chat.",
+    ]);
+  }
+  if (options.temporary === true) {
+    throw invalidArgs("--delete-conversation needs a saved chat.", [
+      "Add --save; temporary chats are not kept in the first place.",
+    ]);
+  }
 }
 
 function applyModelTimeoutDefaults(

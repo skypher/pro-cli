@@ -323,6 +323,8 @@ pro-cli models --json
 --parent <message-id>
 --attach <image-path> (repeatable)
 --keep-conversation
+--delete-conversation
+--preamble "text"
 --verbosity low|medium|high
 --instructions "system text"
 --instructions-file prompt-system.txt
@@ -336,6 +338,8 @@ pro-cli models --json
 --format "<inline format hint>"
 --schema-retries <0..5>
 ```
+
+Connectors such as GitHub only work in saved chats; ChatGPT turns them off in temporary chats. `--save --delete-conversation` runs a chat-model request as a saved chat and deletes it when the job ends, whether it succeeded or failed. A chat that could not be deleted is recorded in `~/.pro-cli/diagnostics/undeleted-conversations.jsonl`. `--preamble` text goes ahead of `--instructions` and the prompt.
 
 Probability (`odds`) only:
 
