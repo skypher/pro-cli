@@ -325,6 +325,15 @@ async function postChatGptJob(
           );
         }
       }
+      if (deleteAfter && parsed.conversationId) {
+        return await preferStoredAnswer(job, parsed.text, parsed.conversationId, browserResult.body, {
+          evaluate,
+          cdpBase,
+          requestStartedAt,
+          timeoutMs,
+          options,
+        });
+      }
       validateCompletedResult(job, parsed.text);
       return parsed.text;
     } finally {
@@ -1426,8 +1435,8 @@ function continuedConversation(job: JobRecord): boolean {
 
 /**
  * Deletes the saved chat a --delete-conversation job created, as the ChatGPT UI does
- * (is_visible: false). Never throws: a chat that stays undeleted is logged to
- * undeleted-conversations.jsonl in the diagnostics dir instead of failing the job.
+ * (is_visible: false). Never throws. The chat id goes to deleted-conversations.jsonl,
+ * or to undeleted-conversations.jsonl if deleting failed, in the diagnostics dir.
  */
 async function deleteJobConversation(
   job: JobRecord,
@@ -1444,15 +1453,26 @@ async function deleteJobConversation(
       buildConversationPatchExpression(conversationId, { is_visible: false }),
       30_000,
     ).then((patch) => patch.ok === true).catch(() => false);
-    if (deleted) return;
+    if (deleted) {
+      await appendConversationRecord(options.diagnosticsDir, "deleted-conversations.jsonl", job, conversationId);
+      return;
+    }
   }
-  if (!options.diagnosticsDir) return;
+  await appendConversationRecord(options.diagnosticsDir, "undeleted-conversations.jsonl", job, conversationId);
+}
+
+// Deleted chats are only hidden (is_visible: false), so a logged id lets a chat be inspected later.
+async function appendConversationRecord(
+  dir: string | undefined,
+  file: string,
+  job: JobRecord,
+  conversationId: string,
+): Promise<void> {
+  if (!dir) return;
   try {
-    await mkdir(options.diagnosticsDir, { recursive: true, mode: 0o700 });
+    await mkdir(dir, { recursive: true, mode: 0o700 });
     const record = { jobId: job.id, conversationId, recordedAt: new Date().toISOString() };
-    await appendFile(join(options.diagnosticsDir, "undeleted-conversations.jsonl"), `${JSON.stringify(record)}\n`, {
-      mode: 0o600,
-    });
+    await appendFile(join(dir, file), `${JSON.stringify(record)}\n`, { mode: 0o600 });
   } catch {
     // best effort; the job result matters more than this record
   }
@@ -1462,7 +1482,7 @@ async function writeStreamDiagnostics(
   dir: string | undefined,
   job: JobRecord,
   code: string,
-  summary: StreamSummary,
+  summary: StreamSummary & { streamedChars?: number; storedChars?: number; streamedIsPrefix?: boolean },
 ): Promise<string | null> {
   if (!dir) return null;
   try {
@@ -1541,6 +1561,46 @@ async function recoverConversationAnswer(
       ...(diagnosticsPath ? { diagnosticsPath } : {}),
     },
   });
+}
+
+/**
+ * A --delete-conversation job reads the chat's stored final answer before the chat is
+ * deleted, since nothing can be checked afterwards. A saved-chat stream can look complete
+ * while the answer is cut off; the stored copy is what the ChatGPT UI shows. When the two
+ * differ, the stored answer wins and a content-free stream summary goes to diagnostics.
+ */
+async function preferStoredAnswer(
+  job: JobRecord,
+  streamedText: string,
+  conversationId: string,
+  rawStream: string,
+  context: {
+    evaluate: PageEvaluator;
+    cdpBase: string;
+    requestStartedAt: number;
+    timeoutMs: number;
+    options: TransportOptions;
+  },
+): Promise<string> {
+  const answerWaitMs = context.timeoutMs > 0 ? context.timeoutMs : DEFAULT_ANSWER_WAIT_MS;
+  const stored = await pollConversationAnswer(conversationId, context.evaluate, context.cdpBase, {
+    notBefore: context.requestStartedAt - 60_000,
+    deadline: context.requestStartedAt + answerWaitMs,
+    pollMs: integerOption(context.options.streamRecoveryPollMs, STREAM_RECOVERY_POLL_MS, 0, 60_000)
+      ?? STREAM_RECOVERY_POLL_MS,
+  });
+  if (stored.text === null || stored.text === streamedText) {
+    validateCompletedResult(job, streamedText);
+    return streamedText;
+  }
+  await writeStreamDiagnostics(context.options.diagnosticsDir, job, "STREAM_ANSWER_MISMATCH", {
+    ...summarizeConversationStream(rawStream),
+    streamedChars: streamedText.length,
+    storedChars: stored.text.length,
+    streamedIsPrefix: stored.text.startsWith(streamedText),
+  });
+  validateCompletedResult(job, stored.text);
+  return stored.text;
 }
 
 async function pollConversationAnswer(

@@ -1658,20 +1658,29 @@ describe("deleteConversation and preamble", () => {
     return { ...base, options: { ...base.options, temporary: false, ...options } };
   }
 
-  // Routes conversation requests to `body`, answer polls to `answer`, and records chat deletions.
+  const storedOk = { ok: true, status: 200, state: "done", text: "OK", message: null };
+
+  // Routes conversation requests to `body`, stored-answer reads to `answer` (default: the
+  // stored copy says "OK"), records chat deletions, and keeps the order of the calls.
   function evaluator(body: string, opts: { answer?: unknown; patchOk?: boolean } = {}) {
     const patches: string[] = [];
+    const order: string[] = [];
     let request = "";
     const pageEvaluator = (async <T>(_base: string, script: string): Promise<T> => {
       if (script.includes("is_visible")) {
+        order.push("delete");
         patches.push(script);
         return { ok: opts.patchOk ?? true, status: opts.patchOk === false ? 500 : 200 } as T;
       }
-      if (script.includes("fetchConversationAnswer")) return opts.answer as T;
+      if (script.includes("fetchConversationAnswer")) {
+        order.push("stored");
+        return (opts.answer ?? storedOk) as T;
+      }
+      order.push("request");
       request = script;
       return { ok: true, status: 200, body } as T;
     });
-    return { pageEvaluator, patches, request: () => request };
+    return { pageEvaluator, patches, order, request: () => request };
   }
 
   test("deletes the new saved chat after the answer arrives", async () => {
@@ -1683,10 +1692,60 @@ describe("deleteConversation and preamble", () => {
       });
 
       expect(result).toBe("OK");
+      expect(fake.order).toEqual(["request", "stored", "delete"]);
       expect(requestBodyFromExpression(fake.request())).not.toHaveProperty("history_and_training_disabled");
       expect(fake.patches).toHaveLength(1);
       expect(fake.patches[0]).toContain("conv_saved");
       expect(fake.patches[0]).toContain('"is_visible":false');
+    });
+  });
+
+  test("uses the stored answer when the streamed one is cut short, and records the mismatch", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const diagnosticsDir = await mkdtemp(join(tmpdir(), "pro-delete-diag-"));
+      try {
+        const fake = evaluator(savedConversationStream("conv_short", "The answer is cu"), {
+          answer: { ok: true, status: 200, state: "done", text: "The answer is cut short no more.", message: null },
+        });
+        const result = await runChatGptJob(savedJob({ deleteConversation: true }), {
+          sessionTokenPath,
+          pageEvaluator: fake.pageEvaluator,
+          diagnosticsDir,
+        });
+
+        expect(result).toBe("The answer is cut short no more.");
+        expect(fake.order).toEqual(["request", "stored", "delete"]);
+        const diagnostics = await readFile(join(diagnosticsDir, "job_test-stream.json"), "utf8");
+        expect(JSON.parse(diagnostics)).toMatchObject({
+          jobId: "job_test",
+          code: "STREAM_ANSWER_MISMATCH",
+          conversationId: "conv_short",
+          streamedChars: 16,
+          storedChars: 32,
+          streamedIsPrefix: true,
+        });
+        expect(diagnostics).not.toContain("The answer is");
+        const deleted = await readFile(join(diagnosticsDir, "deleted-conversations.jsonl"), "utf8");
+        expect(JSON.parse(deleted.trim())).toMatchObject({ jobId: "job_test", conversationId: "conv_short" });
+      } finally {
+        await rm(diagnosticsDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  test("keeps the streamed answer when the stored one cannot be read", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const fake = evaluator(savedConversationStream("conv_gone", "Streamed answer."), {
+        answer: { ok: false, status: 404, state: "pending", text: null, message: null },
+      });
+      const result = await runChatGptJob(savedJob({ deleteConversation: true }), {
+        sessionTokenPath,
+        pageEvaluator: fake.pageEvaluator,
+        streamRecoveryPollMs: 0,
+      });
+
+      expect(result).toBe("Streamed answer.");
+      expect(fake.order).toEqual(["request", "stored", "stored", "stored", "delete"]);
     });
   });
 
