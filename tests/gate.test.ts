@@ -4,6 +4,9 @@ import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runGate, splitCommand, type GateConfig, type ProCliRun } from "../scripts/pro-cli-gate";
+import { Database } from "bun:sqlite";
+import { ProError } from "../src/errors";
+import { JobStore } from "../src/jobs";
 
 const JOB_A = "job_11111111-1111-4111-8111-111111111111";
 const JOB_B = "job_22222222-2222-4222-8222-222222222222";
@@ -443,4 +446,94 @@ test("audit log records error codes of failed calls, not messages", async () => 
     { verb: "pro-cli job wait", code: 1, error: "JOB_NOT_FOUND" },
   ]);
   expect(lines[3]).not.toHaveProperty("error");
+});
+
+describe("usage-limit pause", () => {
+  // A job database whose jobs failed or succeeded at the given times (ISO strings).
+  async function jobsDb(jobs: Array<{ status: "failed" | "succeeded"; errorCode?: string; createdAt: string; updatedAt: string }>) {
+    const path = join(root, "jobs.sqlite");
+    const store = await JobStore.open(path);
+    const ids: string[] = [];
+    try {
+      for (const entry of jobs) {
+        const { id } = store.create({ prompt: "question", model: "gpt-5-5-pro", reasoning: "standard", options: {} });
+        store.markRunning(id);
+        if (entry.status === "failed") {
+          store.markFailed(id, new ProError("UPSTREAM_ERROR", "You've hit your limit.", { details: { errorCode: entry.errorCode ?? null } }));
+        } else {
+          store.markSucceeded(id, "answer");
+        }
+        ids.push(id);
+      }
+    } finally {
+      store.close();
+    }
+    const db = new Database(path);
+    try {
+      jobs.forEach((entry, index) => {
+        db.query("UPDATE jobs SET created_at = ?, updated_at = ? WHERE id = ?").run(entry.createdAt, entry.updatedAt, ids[index]);
+      });
+    } finally {
+      db.close();
+    }
+    cfg.jobsDb = path;
+  }
+  const ago = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
+
+  test("refuses new requests without running pro-cli while a usage-limit refusal is recent", async () => {
+    await jobsDb([{ status: "failed", errorCode: "usage_limit", createdAt: ago(6), updatedAt: ago(5) }]);
+
+    for (const line of ["pro-cli job create --json hello", "pro-cli ask --json hello", "pro-cli job create --github --json hello"]) {
+      const result = await gate(line);
+      expect(result.code).toBe(4);
+      expect(result.error).toBe("USAGE_LIMIT_PAUSED");
+      const details = (JSON.parse(result.stderr.split("\n")[0]) as { error: { details: { refusedAt: string; retryAfter: string } } }).error.details;
+      expect(Date.parse(details.retryAfter) - Date.parse(details.refusedAt)).toBe(30 * 60_000);
+    }
+    expect(calls).toHaveLength(0);
+    const audit = (await readFile(join(root, "state", "tester", "audit.log"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    expect(audit[0]).toMatchObject({ verb: "pro-cli job create", code: 4, error: "USAGE_LIMIT_PAUSED" });
+  });
+
+  test("still answers job status, wait and result during the pause", async () => {
+    await jobsDb([{ status: "failed", errorCode: "usage_limit", createdAt: ago(6), updatedAt: ago(5) }]);
+    await mkdir(join(root, "state", "tester"), { recursive: true });
+    await writeFile(join(root, "state", "tester", "jobs"), `${JOB_A}\n`);
+
+    for (const verb of ["status", "wait", "result"]) {
+      expect((await gate(`pro-cli job ${verb} ${JOB_A} --json`)).code).toBe(0);
+    }
+    expect(calls).toHaveLength(3);
+  });
+
+  test("lets requests through once the pause is over, after other errors, or when a later job succeeded", async () => {
+    for (const jobs of [
+      [{ status: "failed" as const, errorCode: "usage_limit", createdAt: ago(32), updatedAt: ago(31) }],
+      [{ status: "failed" as const, errorCode: "something_else", createdAt: ago(3), updatedAt: ago(2) }],
+      [
+        { status: "failed" as const, errorCode: "usage_limit", createdAt: ago(11), updatedAt: ago(10) },
+        { status: "succeeded" as const, createdAt: ago(9), updatedAt: ago(1) },
+      ],
+    ]) {
+      await rm(join(root, "jobs.sqlite"), { force: true });
+      await jobsDb(jobs);
+      const before = calls.length;
+      expect((await gate("pro-cli job create --json hello")).code).toBe(0);
+      expect(calls).toHaveLength(before + 1);
+    }
+  });
+
+  test("a job that started before the refusal and succeeds later does not end the pause", async () => {
+    await jobsDb([
+      { status: "succeeded", createdAt: ago(20), updatedAt: ago(1) },
+      { status: "failed", errorCode: "usage_limit", createdAt: ago(6), updatedAt: ago(5) },
+    ]);
+    expect((await gate("pro-cli job create --json hello")).error).toBe("USAGE_LIMIT_PAUSED");
+  });
+
+  test("a missing job database never pauses requests", async () => {
+    cfg.jobsDb = join(root, "missing.sqlite");
+    expect((await gate("pro-cli job create --json hello")).code).toBe(0);
+    expect(calls).toHaveLength(1);
+  });
 });

@@ -16,6 +16,7 @@
 //   rm <name>           delete an inbox file
 //   help
 
+import { Database } from "bun:sqlite";
 import { randomBytes } from "node:crypto";
 import { appendFile, lstat, mkdir, open, readdir, readFile, realpath, rename, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -30,6 +31,9 @@ export interface GateConfig {
   maxUploadBytes: number;
   maxInboxBytes: number;
   maxInboxFiles: number;
+  /** pro-cli's job database, read to pause requests while ChatGPT refuses them for a usage limit. */
+  jobsDb?: string;
+  usageLimitPauseMs?: number;
 }
 
 export interface GateIO {
@@ -51,10 +55,16 @@ export class GateError extends Error {
     readonly code: string,
     message: string,
     readonly exitCode = 2,
+    readonly details?: Record<string, unknown>,
   ) {
     super(message);
   }
 }
+
+// Once the account's usage limit is hit, ChatGPT refuses every request (error_code usage_limit)
+// without saying when the limit resets. After a refusal, new requests wait this long instead of
+// each reaching ChatGPT; the first one after the pause shows whether the limit is over.
+const USAGE_LIMIT_PAUSE_MS = 30 * 60_000;
 
 const KEY_NAME = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const FILE_NAME = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/;
@@ -465,6 +475,35 @@ async function putFile(cfg: GateConfig, name: string, io: GateIO): Promise<Recor
   return { name, bytes };
 }
 
+/**
+ * The pause after the account's latest usage-limit refusal, if it still runs. A job created after
+ * that refusal and succeeding ends it early. A missing or unreadable database never pauses requests.
+ */
+export function usageLimitPause(cfg: GateConfig, now = Date.now()): { refusedAt: string; retryAfter: string } | null {
+  if (!cfg.jobsDb) return null;
+  let db: Database | null = null;
+  try {
+    db = new Database(cfg.jobsDb, { readonly: true });
+    const refused = db
+      .query(
+        `SELECT MAX(updated_at) AS at FROM jobs
+         WHERE status = 'failed' AND json_extract(error_json, '$.details.errorCode') = 'usage_limit'`,
+      )
+      .get() as { at: string | null } | null;
+    if (!refused?.at) return null;
+    const succeeded = db
+      .query("SELECT COUNT(*) AS n FROM jobs WHERE status = 'succeeded' AND created_at > ?")
+      .get(refused.at) as { n: number };
+    if (succeeded.n > 0) return null;
+    const retryAt = Date.parse(refused.at) + (cfg.usageLimitPauseMs ?? USAGE_LIMIT_PAUSE_MS);
+    return retryAt > now ? { refusedAt: refused.at, retryAfter: new Date(retryAt).toISOString() } : null;
+  } catch {
+    return null;
+  } finally {
+    db?.close();
+  }
+}
+
 async function runProCli(
   cfg: GateConfig,
   args: string[],
@@ -472,8 +511,20 @@ async function runProCli(
   runner: ProCliRunner,
 ): Promise<{ code: number; errorCode?: string; github: boolean }> {
   const checked = await checkProCliArgs(cfg, args);
-  const result = await runner([...cfg.proCli, ...checked.argv], inboxDir(cfg), cfg.env);
   const kind = checked.command.kind;
+  if (kind === "ask" || kind === "odds" || kind === "job create") {
+    const pause = usageLimitPause(cfg);
+    if (pause) {
+      throw new GateError(
+        "USAGE_LIMIT_PAUSED",
+        `ChatGPT refused this account's last request at ${pause.refusedAt} because its usage limit is reached ` +
+          `("You've hit your limit"). New requests are paused until ${pause.retryAfter}; nothing was sent. Retry after that.`,
+        4,
+        pause,
+      );
+    }
+  }
+  const result = await runner([...cfg.proCli, ...checked.argv], inboxDir(cfg), cfg.env);
   if (kind === "ask" || kind === "odds" || kind === "job create") {
     await recordJobs(cfg, [...createdJobIds(result.stdout), ...createdJobIds(result.stderr)]);
   }
@@ -523,6 +574,9 @@ const HELP = `pro-cli gate. Commands:
   rm <name>                            delete an inbox file
 Files for --attach, --instructions-file and @name must be uploaded with put first.
 Chat models only: Deep Research and image generation are not available.
+When ChatGPT refuses a request because the account's usage limit is reached, ask, odds and
+job create fail with USAGE_LIMIT_PAUSED for 30 minutes (until details.retryAfter) without
+reaching ChatGPT.
 Not available: auth, update, config, setup, doctor, conversations, daemon control,
 --cdp, --port, --conversation, --parent, --save, --store, --no-temporary, --keep-conversation.
 `;
@@ -574,7 +628,12 @@ export async function runGate(cfg: GateConfig, commandLine: string | undefined, 
     }
   } catch (error) {
     const gateError = error instanceof GateError ? error : new GateError("GATE_INTERNAL", String((error as Error)?.message ?? error), 7);
-    io.stderr(`${JSON.stringify({ ok: false, error: { code: gateError.code, message: gateError.message } })}\n`);
+    io.stderr(
+      `${JSON.stringify({
+        ok: false,
+        error: { code: gateError.code, message: gateError.message, ...(gateError.details ? { details: gateError.details } : {}) },
+      })}\n`,
+    );
     code = gateError.exitCode;
     errorCode = gateError.code;
   }
@@ -610,6 +669,7 @@ if (import.meta.main) {
     maxUploadBytes: 50 * 1024 * 1024,
     maxInboxBytes: 500 * 1024 * 1024,
     maxInboxFiles: 200,
+    jobsDb: join(home, ".pro-cli", "jobs.sqlite"),
   };
   const code = await runGate(
     cfg,
