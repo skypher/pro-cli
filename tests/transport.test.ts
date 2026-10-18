@@ -2139,6 +2139,77 @@ describe("deleteConversation and preamble", () => {
     });
   });
 
+  test("fails at once with ChatGPT's error when it refuses the turn, and deletes the chat", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const diagnosticsDir = await mkdtemp(join(tmpdir(), "pro-delete-diag-"));
+      try {
+        const kept: unknown[] = [];
+        const limits: unknown[] = [];
+        const fake = evaluator([
+          'event: delta_encoding\ndata: "v1"',
+          'data: {"type":"resume_conversation_token","token":"t","conversation_id":"conv_refused"}',
+          'data: {"type":"stream_handoff","conversation_id":"conv_refused"}',
+          "data: [DONE]",
+          'event: delta_encoding\ndata: "v1"',
+          'event: delta\ndata: {"p":"","o":"add","v":{"message":{"author":{"role":"user"},"content":{"content_type":"text","parts":["secret question text"]},"status":"finished_successfully"},"conversation_id":"conv_refused"},"c":0}',
+          'data: {"message":null,"conversation_id":"conv_refused","error":"You have reached the limit for this model.","error_code":"model_cap_exceeded"}',
+          'data: {"type":"title_generation","title":"A title","conversation_id":"conv_refused"}',
+          'data: {"type":"conversation_detail_metadata","limits_progress":[{"feature_name":"gpt_pro","remaining":0,"reset_after":"2026-10-19T03:00:00Z"}],"conversation_id":"conv_refused"}',
+          "data: [DONE]",
+          "",
+        ].join("\n\n"));
+
+        const error = await runChatGptJob(savedJob({ deleteConversation: true }), {
+          sessionTokenPath,
+          pageEvaluator: fake.pageEvaluator,
+          diagnosticsDir,
+          streamRecoveryPollMs: 0,
+          onKeptConversation: (entry) => {
+            kept.push(entry);
+          },
+          onLimits: (entries) => limits.push(...entries),
+        }).catch((caught) => caught);
+
+        expect(error).toBeInstanceOf(ProError);
+        expect((error as ProError).code).toBe("UPSTREAM_ERROR");
+        expect((error as ProError).message).toBe("You have reached the limit for this model.");
+        expect((error as ProError).details).toMatchObject({ errorCode: "model_cap_exceeded" });
+        expect(fake.order).toEqual(["request", "delete"]);
+        expect(kept).toEqual([]);
+        expect(limits).toEqual([{ feature_name: "gpt_pro", remaining: 0, reset_after: "2026-10-19T03:00:00Z" }]);
+        const diagnostics = await readFile(join(diagnosticsDir, "job_test-stream.json"), "utf8");
+        expect(JSON.parse(diagnostics)).toMatchObject({ code: "UPSTREAM_ERROR", conversationId: "conv_refused" });
+        expect(diagnostics).toContain("error error_code=model_cap_exceeded");
+        expect(diagnostics).toContain("limits gpt_pro=0@2026-10-19T03:00:00Z");
+        expect(diagnostics).not.toContain("secret question text");
+        expect(diagnostics).not.toContain("reached the limit");
+      } finally {
+        await rm(diagnosticsDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  test("names the usage counters in the summary of a cut-off stream", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const diagnosticsDir = await mkdtemp(join(tmpdir(), "pro-stream-diag-"));
+      try {
+        const pageEvaluator = (async <T>(_base: string, script: string): Promise<T> => {
+          if (script.includes("fetchConversationAnswer")) return { ok: false, status: 403, state: "pending", text: null, message: null } as T;
+          return { ok: true, status: 200, body: cutOffStream("conv_counted", [
+            'data: {"type":"conversation_detail_metadata","limits_progress":[{"feature_name":"gpt_pro","remaining":3,"reset_after":"2026-10-19T03:00:00Z"}],"conversation_id":"conv_counted"}',
+          ]) } as T;
+        });
+
+        await runChatGptJob(job(), { sessionTokenPath, pageEvaluator, diagnosticsDir, streamRecoveryPollMs: 0 }).catch(() => undefined);
+
+        const diagnostics = await readFile(join(diagnosticsDir, "job_test-stream.json"), "utf8");
+        expect(diagnostics).toContain("limits gpt_pro=3@2026-10-19T03:00:00Z");
+      } finally {
+        await rm(diagnosticsDir, { recursive: true, force: true });
+      }
+    });
+  });
+
   test("deletes the chat when the job fails", async () => {
     await withTokenFile(async (sessionTokenPath) => {
       const fake = evaluator(cutOffStream("conv_empty"), {

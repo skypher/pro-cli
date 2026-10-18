@@ -75,6 +75,8 @@ export async function executeClaimedJob(
     return { job: redactJob(completed), result };
   } catch (error) {
     const proError = toProError(error);
+    // A refused job carries the usage counters that explain it.
+    if (observations.length > 0) store.recordLimits(observations, job.id);
     if (store.getResearchTask(job.id) && shouldDeferResearchTaskError(proError)) {
       store.deferResearchTask(job.id, proError, researchTaskRetryDelayMs(proError));
       return {
@@ -157,6 +159,7 @@ export async function executeEphemeralJob(
     };
   } catch (error) {
     const proError = toProError(error);
+    if (observations.length > 0) await persistLimits(paths.dbPath, observations, job.id).catch(() => undefined);
     return {
       job: redactJob({
         ...job,

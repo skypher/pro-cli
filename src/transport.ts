@@ -295,6 +295,11 @@ async function postChatGptJob(
           allowEmptyWithConversation: model === "image",
         });
       } catch (error) {
+        // ChatGPT ended the turn with an error: the chat holds no answer to recover.
+        if (error instanceof ProError && error.code === "UPSTREAM_ERROR") {
+          keepReason = null;
+          await writeStreamDiagnostics(options.diagnosticsDir, job, error.code, summarizeConversationStream(browserResult.body));
+        }
         if (!(error instanceof ProError) || !isRecoverableStreamError(error) || model === "image" || model === "research") {
           throw error;
         }
@@ -1299,6 +1304,7 @@ function readResponse(
   let deepResearchWidget: ResearchTask | null = null;
   let conversationId: string | null = null;
   let completed = false;
+  let turnError: ProError | null = null;
   const state: ResponseParseState = { acceptsTextContinuation: false, inProgressNote: false };
 
   let boundary = buffer.indexOf("\n\n");
@@ -1306,6 +1312,7 @@ function readResponse(
     const frame = buffer.slice(0, boundary);
     buffer = buffer.slice(boundary + 2);
     const event = parseSseFrame(frame);
+    turnError ??= readTurnError(event);
     const parsed = readConversationEvent(event, state);
     if (parsed.text !== null) {
       completedText = mergeStreamText(completedText, parsed.text, parsed.append);
@@ -1323,6 +1330,7 @@ function readResponse(
 
   if (buffer.trim()) {
     const event = parseSseFrame(buffer);
+    turnError ??= readTurnError(event);
     const parsed = readConversationEvent(event, state);
     if (parsed.text !== null) {
       completedText = mergeStreamText(completedText, parsed.text, parsed.append);
@@ -1336,6 +1344,10 @@ function readResponse(
     deepResearchWidget = extractDeepResearchWidgetTask(event, conversationId) ?? deepResearchWidget;
     completed = startsStreamSegment(buffer) ? false : completed || parsed.completed;
   }
+
+  // A refused turn (a usage cap, for example) has an error frame and no answer; polling
+  // the chat for one would wait hours for nothing.
+  if (turnError && !completedText?.trim()) throw turnError;
 
   if (!completed) {
     throw new ProError("STREAM_INCOMPLETE", "ChatGPT stream ended before the conversation completed.", {
@@ -1369,6 +1381,27 @@ function readResponse(
 // was cut off would pass as complete.
 function startsStreamSegment(frame: string): boolean {
   return /^event:\s*delta_encoding\s*$/m.test(frame);
+}
+
+// ChatGPT ends a turn it refuses with {"message": null, "error": "...", "error_code": "..."}
+// right after the user message.
+function readTurnError(event: unknown): ProError | null {
+  if (!isRecord(event) || typeof event.type === "string") return null;
+  const errorCode = typeof event.error_code === "string" && event.error_code ? event.error_code : null;
+  const message = typeof event.error === "string" && event.error
+    ? event.error
+    : isRecord(event.error) && typeof event.error.message === "string" && event.error.message
+      ? event.error.message
+      : null;
+  if (!errorCode && !message) return null;
+  return new ProError("UPSTREAM_ERROR", message ?? `ChatGPT refused the request (${errorCode}).`, {
+    exitCode: EXIT.upstream,
+    suggestions: [
+      "Check whether the ChatGPT Pro usage limit is reached (pro-cli limits --json) before retrying.",
+      "Retry the same real request later only if the user still needs it; do not send a probe query.",
+    ],
+    details: { errorCode },
+  });
 }
 
 function isRecoverableStreamError(error: ProError): boolean {
@@ -1444,6 +1477,13 @@ function describeStreamEvent(event: unknown): string {
   const parts: string[] = [];
   if (typeof event.type === "string") parts.push(event.type);
   if (typeof event.o === "string") parts.push(typeof event.p === "string" && event.p ? `${event.o} ${event.p}` : event.o);
+  if (typeof event.type !== "string" && (event.error || event.error_code)) {
+    parts.push(typeof event.error_code === "string" && event.error_code ? `error error_code=${event.error_code}` : "error");
+  }
+  const limits = extractLimitsProgress(event);
+  if (limits.length > 0) {
+    parts.push(`limits ${limits.map((entry) => `${entry.feature_name}=${entry.remaining}${entry.reset_after ? `@${entry.reset_after}` : ""}`).join(",")}`);
+  }
   if (event.o === "patch" && Array.isArray(event.v)) {
     const ops = event.v
       .filter(isRecord)
