@@ -55,6 +55,23 @@ export interface ResearchTaskRecord extends ResearchTaskInput {
   updatedAt: string;
 }
 
+/** Why a --delete-conversation job kept its chat: it failed, or its answer could not be checked. */
+export type KeptConversationReason = "failed" | "unverified";
+
+export interface KeptConversationInput {
+  conversationId: string;
+  jobId: string;
+  reason: KeptConversationReason;
+  cdpBase?: string | null;
+}
+
+export interface KeptConversationRecord extends KeptConversationInput {
+  cdpBase: string | null;
+  keptAt: string;
+  nextCheckAt: string;
+  checks: number;
+}
+
 export interface ClaimOptions {
   /** Recorded in jobs.claimed_by so other daemons can tell whose running job this is. */
   owner?: string;
@@ -84,6 +101,16 @@ interface JobRow {
   error_json: string | null;
   created_at: string;
   updated_at: string;
+}
+
+interface KeptConversationRow {
+  conversation_id: string;
+  job_id: string;
+  reason: KeptConversationReason;
+  cdp_base: string | null;
+  kept_at: string;
+  next_check_at: string;
+  checks: number;
 }
 
 interface ResearchTaskRow {
@@ -148,6 +175,18 @@ export class JobStore {
     db.run(`
       CREATE INDEX IF NOT EXISTS research_tasks_next_poll_idx
       ON research_tasks(next_poll_at)
+    `);
+    // No foreign key: one-off `ask` jobs keep chats too and have no jobs row.
+    db.run(`
+      CREATE TABLE IF NOT EXISTS kept_conversations (
+        conversation_id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        cdp_base TEXT,
+        kept_at TEXT NOT NULL,
+        next_check_at TEXT NOT NULL,
+        checks INTEGER NOT NULL DEFAULT 0
+      )
     `);
     addColumnIfMissing(db, "jobs", "claimed_by", "TEXT");
     return new JobStore(db);
@@ -441,6 +480,63 @@ export class JobStore {
     return this.getResearchTask(jobId);
   }
 
+  keepConversation(input: KeptConversationInput, checkAfterMs: number): void {
+    const now = Date.now();
+    this.db
+      .query(
+        `INSERT OR REPLACE INTO kept_conversations
+          (conversation_id, job_id, reason, cdp_base, kept_at, next_check_at, checks)
+         VALUES (?, ?, ?, ?, ?, ?, 0)`,
+      )
+      .run(
+        input.conversationId,
+        input.jobId,
+        input.reason,
+        input.cdpBase ?? null,
+        new Date(now).toISOString(),
+        new Date(now + checkAfterMs).toISOString(),
+      );
+  }
+
+  keptConversations(): KeptConversationRecord[] {
+    const rows = this.db.query("SELECT * FROM kept_conversations ORDER BY kept_at").all() as KeptConversationRow[];
+    return rows.map(rowToKeptConversation);
+  }
+
+  dueKeptConversations(now: string, limit = 20): KeptConversationRecord[] {
+    const rows = this.db
+      .query("SELECT * FROM kept_conversations WHERE next_check_at <= ? ORDER BY next_check_at LIMIT ?")
+      .all(now, limit) as KeptConversationRow[];
+    return rows.map(rowToKeptConversation);
+  }
+
+  rescheduleKeptConversation(conversationId: string, nextCheckAt: string): void {
+    this.db
+      .query("UPDATE kept_conversations SET next_check_at = ?, checks = checks + 1 WHERE conversation_id = ?")
+      .run(nextCheckAt, conversationId);
+  }
+
+  forgetKeptConversation(conversationId: string): void {
+    this.db.query("DELETE FROM kept_conversations WHERE conversation_id = ?").run(conversationId);
+  }
+
+  /**
+   * Stores an answer found later in a kept chat. A failed job becomes succeeded with it; a job
+   * that succeeded with an unchecked streamed answer gets the stored one if they differ. Returns
+   * whether the job changed.
+   */
+  recordRecoveredAnswer(jobId: string, result: string, reason: KeptConversationReason): boolean {
+    const now = new Date().toISOString();
+    const changed = reason === "failed"
+      ? this.db
+        .query("UPDATE jobs SET status = ?, result = ?, error_json = NULL, updated_at = ? WHERE id = ? AND status = ?")
+        .run("succeeded", result, now, jobId, "failed")
+      : this.db
+        .query("UPDATE jobs SET result = ?, updated_at = ? WHERE id = ? AND status = ? AND result IS NOT ?")
+        .run(result, now, jobId, "succeeded", result);
+    return changed.changes > 0;
+  }
+
   close(): void {
     this.db.close();
   }
@@ -516,6 +612,18 @@ function rowToJob(row: JobRow): JobRecord {
     error: row.error_json,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  };
+}
+
+function rowToKeptConversation(row: KeptConversationRow): KeptConversationRecord {
+  return {
+    conversationId: row.conversation_id,
+    jobId: row.job_id,
+    reason: row.reason,
+    cdpBase: row.cdp_base,
+    keptAt: row.kept_at,
+    nextCheckAt: row.next_check_at,
+    checks: row.checks,
   };
 }
 

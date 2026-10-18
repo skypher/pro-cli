@@ -339,7 +339,11 @@ pro-cli models --json
 --schema-retries <0..5>
 ```
 
-Connectors such as GitHub only work in saved chats; ChatGPT turns them off in temporary chats. `--save --delete-conversation` runs a chat-model request as a saved chat and deletes it when the job ends, whether it succeeded or failed. A chat that could not be deleted is recorded in `~/.pro-cli/diagnostics/undeleted-conversations.jsonl`. `--preamble` text goes ahead of `--instructions` and the prompt.
+Connectors such as GitHub only work in saved chats; ChatGPT turns them off in temporary chats. `--save --delete-conversation` runs a chat-model request as a saved chat and deletes it once the answer is safe. The answer is checked against ChatGPT's stored copy before the chat goes, because a deleted chat can never be read again. A job that fails, or whose stored copy cannot be read, keeps its chat for up to six hours (`kept-conversations.jsonl`). Meanwhile the daemon looks at kept chats every ten minutes and deletes each one after storing its answer, or once the answer turns out empty or the six hours are up:
+- a failed job whose answer turns up becomes succeeded with it;
+- an unchecked answer that differs from the stored copy is replaced by it.
+
+Recovered answers are logged in `recovered-answers.jsonl`. A chat that could not be deleted goes to `undeleted-conversations.jsonl`. All these logs are in `~/.pro-cli/diagnostics/`. When ChatGPT rate-limits chat reads, the 429's Retry-After pauses the reads of every job using the same browser. `--preamble` text goes ahead of `--instructions` and the prompt.
 
 Probability (`odds`) only:
 

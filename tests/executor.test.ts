@@ -231,6 +231,33 @@ describe("buildEphemeralJob", () => {
   });
 });
 
+describe("executeClaimedJob kept chats", () => {
+  test("records the chat a failed job kept, with its job and browser, for the daemon to settle", async () => {
+    await withStore(async (store) => {
+      const created = store.create({
+        prompt: "question",
+        model: "gpt-5-5-pro",
+        reasoning: "standard",
+        options: { deleteConversation: true, cdpBase: "http://127.0.0.1:9333" },
+      });
+      const claimed = store.claimQueued(created.id);
+      if (!claimed) throw new Error("Expected claimed job.");
+
+      await executeClaimedJob(store, claimed, testPaths(), {
+        runJob: async (_job, options) => {
+          await options.onKeptConversation?.({ conversationId: "conv_failed", reason: "failed" });
+          throw new ProError("STREAM_INCOMPLETE", "cut off");
+        },
+      });
+
+      expect(store.get(created.id).status).toBe("failed");
+      expect(store.keptConversations()).toMatchObject([
+        { conversationId: "conv_failed", jobId: created.id, reason: "failed", cdpBase: "http://127.0.0.1:9333", checks: 0 },
+      ]);
+    });
+  });
+});
+
 describe("executeClaimedJob research task durability", () => {
   test("persists launched Deep Research task metadata before returning the final result", async () => {
     await withStore(async (store) => {

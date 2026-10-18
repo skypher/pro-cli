@@ -1994,6 +1994,151 @@ describe("deleteConversation and preamble", () => {
     });
   });
 
+  test("hands a failed job's chat over instead of deleting it", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const diagnosticsDir = await mkdtemp(join(tmpdir(), "pro-delete-diag-"));
+      try {
+        const kept: unknown[] = [];
+        const fake = evaluator(cutOffStream("conv_failed"), {
+          answer: { ok: true, status: 200, state: "empty", text: null, message: "assistant text finished_successfully" },
+        });
+        await expect(
+          runChatGptJob(savedJob({ deleteConversation: true }), {
+            sessionTokenPath,
+            pageEvaluator: fake.pageEvaluator,
+            diagnosticsDir,
+            streamRecoveryPollMs: 0,
+            onKeptConversation: (entry) => {
+              kept.push(entry);
+            },
+          }),
+        ).rejects.toBeInstanceOf(ProError);
+        expect(kept).toEqual([{ conversationId: "conv_failed", reason: "failed" }]);
+        expect(fake.patches).toHaveLength(0);
+        const log = await readFile(join(diagnosticsDir, "kept-conversations.jsonl"), "utf8");
+        expect(JSON.parse(log.trim())).toMatchObject({ jobId: "job_test", conversationId: "conv_failed", reason: "failed" });
+      } finally {
+        await rm(diagnosticsDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  test("hands the chat over when the stored answer cannot be read, and deletes it when that is checked", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const cases: Array<[unknown, unknown[]]> = [
+        [{ ok: false, status: 403, state: "pending", text: null, message: null }, [{ conversationId: "conv_check", reason: "unverified" }]],
+        [storedOk, []],
+      ];
+      for (const [answer, expected] of cases) {
+        const kept: unknown[] = [];
+        const fake = evaluator(savedConversationStream("conv_check", "OK"), { answer });
+        const result = await runChatGptJob(savedJob({ deleteConversation: true }), {
+          sessionTokenPath,
+          pageEvaluator: fake.pageEvaluator,
+          streamRecoveryPollMs: 0,
+          onKeptConversation: (entry) => {
+            kept.push(entry);
+          },
+        });
+        expect(result).toBe("OK");
+        expect(kept).toEqual(expected);
+        expect(fake.patches).toHaveLength(expected.length === 0 ? 1 : 0);
+      }
+    });
+  });
+
+  test("deletes the chat when handing it over fails", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const fake = evaluator(savedConversationStream("conv_nohome", "OK"), {
+        answer: { ok: false, status: 403, state: "pending", text: null, message: null },
+      });
+      const result = await runChatGptJob(savedJob({ deleteConversation: true }), {
+        sessionTokenPath,
+        pageEvaluator: fake.pageEvaluator,
+        streamRecoveryPollMs: 0,
+        onKeptConversation: () => {
+          throw new Error("database is locked");
+        },
+      });
+      expect(result).toBe("OK");
+      expect(fake.patches).toHaveLength(1);
+    });
+  });
+
+  test("gives up at once on a Retry-After longer than it may wait", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const fake = evaluator(savedConversationStream("conv_later", "OK"), {
+        answer: [{ ok: false, status: 429, state: "pending", text: null, message: null, retryAfterMs: 20 * 60_000 }, storedOk],
+      });
+      const started = Date.now();
+      const result = await runChatGptJob(savedJob({ deleteConversation: true }), {
+        sessionTokenPath,
+        pageEvaluator: fake.pageEvaluator,
+        streamRecoveryPollMs: 0,
+      });
+      expect(result).toBe("OK");
+      expect(Date.now() - started).toBeLessThan(1_000);
+      expect(fake.order).toEqual(["request", "stored", "delete"]);
+    });
+  });
+
+  test("a rate-limited read holds back the reads of other jobs until its Retry-After", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const reads: Array<{ conversation: string; at: number; status: number }> = [];
+      const pageEvaluator = (async <T>(_base: string, script: string): Promise<T> => {
+        if (script.includes("is_visible")) return { ok: true, status: 200 } as T;
+        if (script.includes("fetchConversationAnswer")) {
+          const conversation = script.includes('"conv_a"') ? "conv_a" : "conv_b";
+          const limited = conversation === "conv_a" && !reads.some((read) => read.conversation === "conv_a");
+          reads.push({ conversation, at: Date.now(), status: limited ? 429 : 200 });
+          return (limited
+            ? { ok: false, status: 429, state: "pending", text: null, message: null, retryAfterMs: 200 }
+            : storedOk) as T;
+        }
+        if (script.includes("Second question")) {
+          await Bun.sleep(50);
+          return { ok: true, status: 200, body: savedConversationStream("conv_b", "OK") } as T;
+        }
+        return { ok: true, status: 200, body: savedConversationStream("conv_a", "OK") } as T;
+      });
+      const run = (jobRecord: JobRecord) =>
+        runChatGptJob(jobRecord, { sessionTokenPath, pageEvaluator, streamRecoveryPollMs: 0 });
+
+      const results = await Promise.all([
+        run(savedJob({ deleteConversation: true })),
+        run({ ...savedJob({ deleteConversation: true }), prompt: "Second question" }),
+      ]);
+
+      expect(results).toEqual(["OK", "OK"]);
+      const limitedAt = reads.find((read) => read.status === 429)?.at ?? 0;
+      const second = reads.filter((read) => read.conversation === "conv_b");
+      expect(second).toHaveLength(1);
+      expect(second[0].at - limitedAt).toBeGreaterThanOrEqual(180);
+    });
+  });
+
+  test("slows its polls while a cut-off stream's answer stays pending", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const pending = { ok: true, status: 200, state: "pending", text: null, message: "assistant thoughts in_progress" };
+      const reads: number[] = [];
+      const pageEvaluator = (async <T>(_base: string, script: string): Promise<T> => {
+        if (script.includes("fetchConversationAnswer")) {
+          reads.push(Date.now());
+          return (reads.length < 6 ? pending : { ok: true, status: 200, state: "done", text: "Recovered answer", message: null }) as T;
+        }
+        return { ok: true, status: 200, body: cutOffStream("conv_slow") } as T;
+      });
+
+      const result = await runChatGptJob(job(), { sessionTokenPath, pageEvaluator, streamRecoveryPollMs: 10 });
+
+      expect(result).toBe("Recovered answer");
+      const gaps = reads.slice(1).map((at, index) => at - reads[index]);
+      expect(gaps[0]).toBeLessThan(25);
+      expect(gaps[4]).toBeGreaterThanOrEqual(45);
+      expect(gaps[4]).toBeLessThan(80 + 40);
+    });
+  });
+
   test("deletes the chat when the job fails", async () => {
     await withTokenFile(async (sessionTokenPath) => {
       const fake = evaluator(cutOffStream("conv_empty"), {

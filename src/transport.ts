@@ -5,12 +5,12 @@ import { evaluateInCdpPage, recoverCookieBloatInCdp } from "./cdp";
 import { chatGptOrigins } from "./cookies";
 import { DEFAULT_MODEL, isReasoningLevel } from "./defaults";
 import { EXIT, ProError } from "./errors";
-import type { JobRecord, LimitsObservation } from "./jobs";
+import type { JobRecord, KeptConversationReason, LimitsObservation } from "./jobs";
 import { canonicalModelId, modelUsesThinkingEffort } from "./models";
 import { isTokenFresh, loadSessionToken } from "./session-token";
 
 const CHATGPT_CONVERSATION_ENDPOINT = "https://chatgpt.com/backend-api/f/conversation";
-const DEFAULT_CDP_BASE = "http://127.0.0.1:9222";
+export const DEFAULT_CDP_BASE = "http://127.0.0.1:9222";
 const DEFAULT_RESEARCH_TASK_POLL_MS = 5_000;
 const DEFAULT_RESEARCH_WIDGET_POLL_MS = 30_000;
 const DEFAULT_RESEARCH_WIDGET_RATE_LIMIT_POLL_MS = 60_000;
@@ -23,15 +23,39 @@ const DEFAULT_IMAGE_POLL_MS = 3_000;
 const DEFAULT_IMAGE_RATE_LIMIT_POLL_MS = 30_000;
 const BROWSER_STREAM_MARGIN_MS = 2 * 60_000;
 const STREAM_RECOVERY_POLL_MS = 15_000;
+// While the answer is pending, each recovery poll waits half again as long as the last, up to
+// eight times the first interval (2 minutes by default). A Pro answer takes minutes, so this
+// costs little delay, and a job that waits for hours does not use up the account's chat reads.
+const STREAM_RECOVERY_POLL_GROWTH = 1.5;
+const STREAM_RECOVERY_MAX_POLL_FACTOR = 8;
 const MAX_ANSWER_FETCH_BACKOFF_MS = 5 * 60_000;
 // How long a --delete-conversation job keeps retrying rate-limited reads of the stored
-// answer before it falls back to the streamed answer and deletes the chat.
+// answer before it falls back to the streamed answer.
 const STORED_ANSWER_TRANSIENT_LIMIT_MS = 15 * 60_000;
 // Without --timeout, a job waits this long in total for a Pro answer; long Pro
 // runs can take well over an hour.
 const DEFAULT_ANSWER_WAIT_MS = 3 * 60 * 60_000;
 
-type PageEvaluator = <T>(cdpBase: string, expression: string, timeoutMs?: number) => Promise<T>;
+export type PageEvaluator = <T>(cdpBase: string, expression: string, timeoutMs?: number) => Promise<T>;
+
+// ChatGPT rate-limits chat reads per account, and one 429 can ask for half an hour. A 429 seen
+// by one job holds back the reads of every job using the same browser, so they don't all keep
+// asking. Keyed by evaluator: the daemon's jobs share evaluateInCdpPage, while each test's fake
+// evaluator has its own.
+const conversationReadPauses = new WeakMap<PageEvaluator, Map<string, number>>();
+
+export function conversationReadPauseMs(evaluate: PageEvaluator, cdpBase: string): number {
+  return Math.max(0, (conversationReadPauses.get(evaluate)?.get(cdpBase) ?? 0) - Date.now());
+}
+
+export function pauseConversationReads(evaluate: PageEvaluator, cdpBase: string, ms: number): void {
+  let pauses = conversationReadPauses.get(evaluate);
+  if (!pauses) {
+    pauses = new Map();
+    conversationReadPauses.set(evaluate, pauses);
+  }
+  pauses.set(cdpBase, Math.max(pauses.get(cdpBase) ?? 0, Date.now() + ms));
+}
 
 export interface TransportOptions {
   sessionTokenPath: string;
@@ -46,6 +70,12 @@ export interface TransportOptions {
   onLimits?: (observations: LimitsObservation[]) => void;
   onResearchTask?: (task: ResearchTask) => void | Promise<void>;
   onResearchTaskStatus?: (update: ResearchTaskStatusUpdate) => void | Promise<void>;
+  /**
+   * Takes over the chat of a --delete-conversation job that failed or whose answer could not be
+   * checked, so the answer can still be recovered from it. Without it such chats are deleted
+   * right away.
+   */
+  onKeptConversation?: (kept: { conversationId: string; reason: KeptConversationReason }) => void | Promise<void>;
   keepImageConversation?: boolean;
 }
 
@@ -256,6 +286,8 @@ async function postChatGptJob(
     const model = canonicalModelId(job.model);
     const deleteAfter =
       job.options.deleteConversation === true && model !== "image" && model !== "research" && !continuedConversation(job);
+    // Stays "failed" unless the job ends with an answer; a chat is deleted only once its answer is safe.
+    let keepReason: KeptConversationReason | null = "failed";
     try {
       let parsed: ParsedConversationResponse;
       try {
@@ -266,13 +298,15 @@ async function postChatGptJob(
         if (!(error instanceof ProError) || !isRecoverableStreamError(error) || model === "image" || model === "research") {
           throw error;
         }
-        return await recoverConversationAnswer(job, error, browserResult.body, {
+        const recovered = await recoverConversationAnswer(job, error, browserResult.body, {
           evaluate,
           cdpBase,
           requestStartedAt,
           timeoutMs,
           options,
         });
+        keepReason = null;
+        return recovered;
       }
       if (model === "image") {
         if (parsed.text.toLowerCase().includes("image generation isn") && parsed.text.toLowerCase().includes("temporary chat")) {
@@ -330,18 +364,21 @@ async function postChatGptJob(
         }
       }
       if (deleteAfter && parsed.conversationId) {
-        return await preferStoredAnswer(job, parsed.text, parsed.conversationId, browserResult.body, {
+        const answer = await preferStoredAnswer(job, parsed.text, parsed.conversationId, browserResult.body, {
           evaluate,
           cdpBase,
           requestStartedAt,
           timeoutMs,
           options,
         });
+        keepReason = answer.verified ? null : "unverified";
+        return answer.text;
       }
       validateCompletedResult(job, parsed.text);
+      keepReason = null;
       return parsed.text;
     } finally {
-      if (deleteAfter) await deleteJobConversation(job, browserResult.body, evaluate, cdpBase, options);
+      if (deleteAfter) await settleJobConversation(job, browserResult.body, keepReason, evaluate, cdpBase, options);
     }
   } catch (error) {
     if (error instanceof ProError) throw error;
@@ -1446,45 +1483,79 @@ function continuedConversation(job: JobRecord): boolean {
 }
 
 /**
- * Deletes the saved chat a --delete-conversation job created, as the ChatGPT UI does
- * (is_visible: false). Never throws. The chat id goes to deleted-conversations.jsonl,
- * or to undeleted-conversations.jsonl if deleting failed, in the diagnostics dir.
+ * Ends the saved chat a --delete-conversation job created. A job that failed or could not check
+ * its answer hands the chat to onKeptConversation (logged in kept-conversations.jsonl), since a
+ * deleted chat can never be read again; otherwise, or if handing it over fails, the chat is
+ * deleted now. Never throws.
  */
-async function deleteJobConversation(
+async function settleJobConversation(
   job: JobRecord,
   rawStream: string,
+  keepReason: KeptConversationReason | null,
   evaluate: PageEvaluator,
   cdpBase: string,
   options: TransportOptions,
 ): Promise<void> {
   const conversationId = summarizeConversationStream(rawStream).conversationId;
   if (!conversationId) return;
+  if (keepReason && options.onKeptConversation) {
+    try {
+      await options.onKeptConversation({ conversationId, reason: keepReason });
+      await appendConversationRecord(options.diagnosticsDir, "kept-conversations.jsonl", job.id, conversationId, {
+        reason: keepReason,
+      });
+      return;
+    } catch {
+      // Nothing would come back for the chat, so delete it as before.
+    }
+  }
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const deleted = await evaluate<BrowserConversationPatchResult>(
-      cdpBase,
-      buildConversationPatchExpression(conversationId, { is_visible: false }),
-      30_000,
-    ).then((patch) => patch.ok === true).catch(() => false);
+    const deleted = await deleteSavedConversation(conversationId, evaluate, cdpBase)
+      .then((patch) => patch.ok === true)
+      .catch(() => false);
     if (deleted) {
-      await appendConversationRecord(options.diagnosticsDir, "deleted-conversations.jsonl", job, conversationId);
+      await appendConversationRecord(options.diagnosticsDir, "deleted-conversations.jsonl", job.id, conversationId);
       return;
     }
   }
-  await appendConversationRecord(options.diagnosticsDir, "undeleted-conversations.jsonl", job, conversationId);
+  await appendConversationRecord(options.diagnosticsDir, "undeleted-conversations.jsonl", job.id, conversationId);
+}
+
+/** Deletes a saved chat as the ChatGPT UI does (is_visible: false). */
+export async function deleteSavedConversation(
+  conversationId: string,
+  evaluate: PageEvaluator,
+  cdpBase: string,
+): Promise<BrowserConversationPatchResult> {
+  return await evaluate<BrowserConversationPatchResult>(
+    cdpBase,
+    buildConversationPatchExpression(conversationId, { is_visible: false }),
+    30_000,
+  );
+}
+
+/** Reads a saved chat's stored final answer once. */
+export async function readStoredAnswer(
+  conversationId: string,
+  evaluate: PageEvaluator,
+  cdpBase: string,
+): Promise<ConversationAnswerFetchResult> {
+  return await evaluate<ConversationAnswerFetchResult>(cdpBase, buildConversationAnswerFetchExpression(conversationId, 0), 30_000);
 }
 
 // The logged id ties a job to the chat it deleted. A deleted chat (is_visible: false) cannot be
 // read or restored afterwards: both GET and PATCH return 404.
-async function appendConversationRecord(
+export async function appendConversationRecord(
   dir: string | undefined,
   file: string,
-  job: JobRecord,
+  jobId: string,
   conversationId: string,
+  extra: Record<string, unknown> = {},
 ): Promise<void> {
   if (!dir) return;
   try {
     await mkdir(dir, { recursive: true, mode: 0o700 });
-    const record = { jobId: job.id, conversationId, recordedAt: new Date().toISOString() };
+    const record = { jobId, conversationId, ...extra, recordedAt: new Date().toISOString() };
     await appendFile(join(dir, file), `${JSON.stringify(record)}\n`, { mode: 0o600 });
   } catch {
     // best effort; the job result matters more than this record
@@ -1515,7 +1586,7 @@ async function writeStreamDiagnostics(
   }
 }
 
-interface ConversationAnswerFetchResult {
+export interface ConversationAnswerFetchResult {
   ok: boolean;
   status: number;
   state: "done" | "pending" | "empty" | "incomplete";
@@ -1589,6 +1660,7 @@ async function recoverConversationAnswer(
  * deleted, since nothing can be checked afterwards. A saved-chat stream can look complete
  * while the answer is cut off; the stored copy is what the ChatGPT UI shows. When the two
  * differ, the stored answer wins and a content-free stream summary goes to diagnostics.
+ * verified is false when the stored copy could not be read and the streamed answer is used.
  */
 async function preferStoredAnswer(
   job: JobRecord,
@@ -1602,7 +1674,7 @@ async function preferStoredAnswer(
     timeoutMs: number;
     options: TransportOptions;
   },
-): Promise<string> {
+): Promise<{ text: string; verified: boolean }> {
   const answerWaitMs = context.timeoutMs > 0 ? context.timeoutMs : DEFAULT_ANSWER_WAIT_MS;
   const stored = await pollConversationAnswer(conversationId, context.evaluate, context.cdpBase, {
     notBefore: context.requestStartedAt - 60_000,
@@ -1620,7 +1692,7 @@ async function preferStoredAnswer(
   }
   if (stored.text === null || stored.text === streamedText) {
     validateCompletedResult(job, streamedText);
-    return streamedText;
+    return { text: streamedText, verified: stored.text !== null };
   }
   await writeStreamDiagnostics(context.options.diagnosticsDir, job, "STREAM_ANSWER_MISMATCH", {
     ...summarizeConversationStream(rawStream),
@@ -1630,7 +1702,7 @@ async function preferStoredAnswer(
     firstDifferenceAt: firstDifference(streamedText, stored.text),
   });
   validateCompletedResult(job, stored.text);
-  return stored.text;
+  return { text: stored.text, verified: true };
 }
 
 function firstDifference(a: string, b: string): number {
@@ -1643,7 +1715,7 @@ function firstDifference(a: string, b: string): number {
 
 // Rate limits and server errors on the conversation fetch pass; with ten jobs polling,
 // ChatGPT answers some fetches with 429. Back off and keep polling instead of giving up.
-function isTransientAnswerFetchStatus(status: number): boolean {
+export function isTransientAnswerFetchStatus(status: number): boolean {
   return status === 200 || status === 408 || status === 429 || status >= 500;
 }
 
@@ -1658,8 +1730,25 @@ async function pollConversationAnswer(
   let transient = 0;
   let streak = 0;
   let transientSince: number | null = null;
+  let pendingPollMs = options.pollMs;
   let last: ConversationAnswerFetchResult | null = null;
+  // A wait for rate limits or server errors that would run past the deadline, or past the
+  // transient limit, ends the polling instead.
+  const givesUp = (waitMs: number): boolean => {
+    transientSince ??= Date.now();
+    const overLimit = options.transientLimitMs !== undefined
+      && Date.now() - transientSince + waitMs > options.transientLimitMs;
+    return overLimit || Date.now() + waitMs > options.deadline;
+  };
   while (true) {
+    const pausedMs = conversationReadPauseMs(evaluate, cdpBase);
+    if (pausedMs > 0) {
+      if (givesUp(pausedMs)) {
+        return { text: null, recovery: { state: "unavailable", status: 429, polls, transient } };
+      }
+      await sleep(pausedMs);
+      continue;
+    }
     polls += 1;
     let fetched: ConversationAnswerFetchResult | null = null;
     try {
@@ -1685,14 +1774,13 @@ async function pollConversationAnswer(
     if (fetched && !fetched.ok && isTransientAnswerFetchStatus(fetched.status)) {
       transient += 1;
       streak += 1;
-      transientSince ??= Date.now();
-      const waitMs = Math.min(
-        MAX_ANSWER_FETCH_BACKOFF_MS,
-        Math.max(fetched.retryAfterMs ?? 0, options.pollMs * 2 ** Math.min(streak - 1, 5)),
+      // Retry-After is waited out in full; without one, back off up to MAX_ANSWER_FETCH_BACKOFF_MS.
+      const waitMs = Math.max(
+        fetched.retryAfterMs ?? 0,
+        Math.min(MAX_ANSWER_FETCH_BACKOFF_MS, options.pollMs * 2 ** Math.min(streak - 1, 5)),
       );
-      const overLimit = options.transientLimitMs !== undefined
-        && Date.now() - transientSince + waitMs > options.transientLimitMs;
-      if (overLimit || Date.now() + waitMs > options.deadline) {
+      if (fetched.status === 429) pauseConversationReads(evaluate, cdpBase, waitMs);
+      if (givesUp(waitMs)) {
         return { text: null, recovery: { state: "unavailable", status: fetched.status, polls, transient } };
       }
       await sleep(waitMs);
@@ -1711,7 +1799,12 @@ async function pollConversationAnswer(
         recovery: { state: "timeout", ...(last ? { status: last.status, message: last.message } : {}), polls },
       };
     }
-    await sleep(options.pollMs);
+    if (fetched?.ok) {
+      await sleep(Math.min(pendingPollMs, options.deadline - Date.now()));
+      pendingPollMs = Math.min(options.pollMs * STREAM_RECOVERY_MAX_POLL_FACTOR, pendingPollMs * STREAM_RECOVERY_POLL_GROWTH);
+    } else {
+      await sleep(options.pollMs);
+    }
   }
 }
 
@@ -2818,7 +2911,7 @@ interface BrowserAttachmentUploadResult {
   error: string | null;
 }
 
-interface BrowserConversationPatchResult {
+export interface BrowserConversationPatchResult {
   ok: boolean;
   status: number;
 }

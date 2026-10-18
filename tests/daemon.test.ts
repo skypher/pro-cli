@@ -14,7 +14,10 @@ import {
 } from "../src/daemon";
 import { resolvePaths, type RuntimePaths } from "../src/config";
 import type { ExecutorTransports } from "../src/executor";
+import { ProError } from "../src/errors";
 import { JobStore, type JobRecord } from "../src/jobs";
+import type { KeptConversationSweepOptions } from "../src/kept-conversations";
+import type { PageEvaluator } from "../src/transport";
 
 describe("daemon runtime files", () => {
   test("daemon serve creates the advertised log path", async () => {
@@ -167,6 +170,41 @@ describe("concurrent daemon", () => {
   });
 });
 
+describe("kept chats", () => {
+  test("the daemon puts a kept chat's answer into its failed job and then deletes the chat", async () => {
+    const home = await mkdtemp(join(tmpdir(), "pro-daemon-test-"));
+    const paths = resolvePaths({ PRO_CLI_HOME: home });
+    const store = await JobStore.open(paths.dbPath);
+    let id = "";
+    try {
+      id = store.create(jobInput("kept")).id;
+      store.claimNextQueued(`${process.pid}:other-daemon`);
+      store.markFailed(id, new ProError("STREAM_INCOMPLETE", "cut off"));
+      store.keepConversation({ conversationId: "conv_daemon", jobId: id, reason: "failed" }, 0);
+    } finally {
+      store.close();
+    }
+    const calls: string[] = [];
+    const evaluate = (async <T>(_base: string, script: string): Promise<T> => {
+      if (script.includes("is_visible")) {
+        calls.push("delete");
+        return { ok: true, status: 200 } as T;
+      }
+      calls.push("read");
+      return { ok: true, status: 200, state: "done", text: "Recovered answer", message: null } as T;
+    }) as PageEvaluator;
+    try {
+      await withDaemon({ home, transports: instantTransport(), keptConversations: { evaluate } }, async () => {
+        await until(() => calls.includes("delete"));
+        expect(await jobStatus(paths, id)).toBe("succeeded");
+      });
+      expect(calls).toEqual(["read", "delete"]);
+    } finally {
+      await cleanup(home);
+    }
+  });
+});
+
 describe("runtime directory safety", () => {
   test("ignores an endpoint in a runtime directory that others can write", async () => {
     await withDaemon({ transports: instantTransport() }, async ({ paths }) => {
@@ -268,7 +306,12 @@ function runtimeFor(home: string): Runtime {
 }
 
 async function withDaemon(
-  options: { home?: string; concurrency?: number; transports?: ExecutorTransports },
+  options: {
+    home?: string;
+    concurrency?: number;
+    transports?: ExecutorTransports;
+    keptConversations?: Pick<KeptConversationSweepOptions, "evaluate">;
+  },
   fn: (context: { home: string; paths: RuntimePaths }) => Promise<void>,
 ): Promise<void> {
   const home = options.home ?? (await mkdtemp(join(tmpdir(), "pro-daemon-test-")));
@@ -278,6 +321,7 @@ async function withDaemon(
     pollMs: 25,
     concurrency: options.concurrency,
     transports: options.transports,
+    keptConversations: options.keptConversations,
   });
   try {
     await waitForRunningDaemon(paths);

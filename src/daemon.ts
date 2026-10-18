@@ -9,6 +9,7 @@ import { ensurePrivateDir, writePrivateFile } from "./config";
 import { EXIT, ProError, type ErrorPayload, type ExitCode, toProError } from "./errors";
 import { executeClaimedJob, waitForJob, waitTimeoutError, type ExecutorTransports, type JobWaitOutcome } from "./executor";
 import { JobStore, redactJob, type CreateJobInput, type JobRecord } from "./jobs";
+import { sweepKeptConversations, type KeptConversationSweepOptions } from "./kept-conversations";
 import type { CliIO } from "./output";
 
 const DEFAULT_DAEMON_START_TIMEOUT_MS = 5_000;
@@ -21,6 +22,8 @@ const DAEMON_PROTOCOL = 2;
 const RESEARCH_LEASE_MS = 120_000;
 const LEASE_RENEW_MS = 30_000;
 const ORPHAN_SWEEP_MS = 30_000;
+// Each kept chat has its own next check; this is how often the daemon looks for due ones.
+const KEPT_CONVERSATION_SWEEP_MS = 60_000;
 const DRAIN_GRACE_MS = 1_000;
 
 export interface DaemonEndpoint {
@@ -380,6 +383,7 @@ export async function runDaemonServer(
     idleTimeoutMs?: number;
     concurrency?: number;
     transports?: ExecutorTransports;
+    keptConversations?: Pick<KeptConversationSweepOptions, "evaluate" | "now" | "maxAgeMs" | "checkMs">;
   } = {},
 ): Promise<void> {
   await ensurePrivateDir(paths.home);
@@ -399,6 +403,8 @@ export async function runDaemonServer(
   let lastActivityAt = Date.now();
   let lastLeaseRenewal = Date.now();
   let lastOrphanSweep = 0;
+  let lastKeptSweep = 0;
+  let keptSweep: Promise<void> | null = null;
   let publishing: Promise<void> = Promise.resolve();
   let heartbeat: ReturnType<typeof setInterval> | undefined;
   let maintenance: ReturnType<typeof setInterval> | undefined;
@@ -514,6 +520,19 @@ export async function runDaemonServer(
       if (!draining && now - lastOrphanSweep >= ORPHAN_SWEEP_MS) {
         lastOrphanSweep = now;
         failOrphanedJobs(store, owner);
+      }
+      // Only the daemon taking new work settles kept chats, so a draining one never races it.
+      if (!draining && !keptSweep && now - lastKeptSweep >= KEPT_CONVERSATION_SWEEP_MS) {
+        lastKeptSweep = now;
+        keptSweep = sweepKeptConversations(store, {
+          ...options.keptConversations,
+          diagnosticsDir: join(paths.home, "diagnostics"),
+          shouldContinue: () => !draining && !stopped,
+        })
+          .catch((error) => logDaemonError("settling kept chats failed", error))
+          .finally(() => {
+            keptSweep = null;
+          });
       }
     } catch (error) {
       logDaemonError("daemon maintenance failed", error);

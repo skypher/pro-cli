@@ -2,7 +2,16 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { RuntimePaths } from "./config";
 import { EXIT, ProError, toProError } from "./errors";
-import { JobStore, redactJob, type JobRecord, type JobStatus, type LimitsObservation, type ResearchTaskRecord } from "./jobs";
+import {
+  JobStore,
+  redactJob,
+  type JobRecord,
+  type JobStatus,
+  type KeptConversationInput,
+  type LimitsObservation,
+  type ResearchTaskRecord,
+} from "./jobs";
+import { KEPT_CONVERSATION_CHECK_MS } from "./kept-conversations";
 import {
   runChatGptJob,
   runChatGptResearchTask,
@@ -49,6 +58,12 @@ export async function executeClaimedJob(
       },
       onResearchTaskStatus: (update) => {
         store.updateResearchTaskStatus(job.id, update.status, leaseUntil());
+      },
+      onKeptConversation: (kept) => {
+        store.keepConversation(
+          { ...kept, jobId: job.id, cdpBase: stringFromOption(job.options.cdpBase) ?? null },
+          KEPT_CONVERSATION_CHECK_MS,
+        );
       },
     };
     const existingTask = store.getResearchTask(job.id);
@@ -128,6 +143,12 @@ export async function executeEphemeralJob(
       keepImageConversation:
         job.options.keepConversation === true || typeof job.options.conversationId === "string",
       onLimits: (entries) => observations.push(...entries),
+      onKeptConversation: (kept) =>
+        persistKeptConversation(paths.dbPath, {
+          ...kept,
+          jobId: job.id,
+          cdpBase: stringFromOption(job.options.cdpBase) ?? null,
+        }),
     });
     if (observations.length > 0) await persistLimits(paths.dbPath, observations, job.id);
     return {
@@ -157,6 +178,16 @@ async function persistLimits(
   const store = await JobStore.open(dbPath);
   try {
     store.recordLimits(observations, jobId);
+  } finally {
+    store.close();
+  }
+}
+
+// The daemon's sweep settles the chat later; a one-off job has no daemon of its own.
+async function persistKeptConversation(dbPath: string, kept: KeptConversationInput): Promise<void> {
+  const store = await JobStore.open(dbPath);
+  try {
+    store.keepConversation(kept, KEPT_CONVERSATION_CHECK_MS);
   } finally {
     store.close();
   }
