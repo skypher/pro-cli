@@ -35,12 +35,14 @@ afterEach(async () => {
 const ago = (minutes: number) => new Date(now.getTime() - minutes * 60_000).toISOString();
 
 // Adds jobs that ended as given; times are minutes before `now`.
-async function jobs(entries: Array<{ status: "failed" | "succeeded" | "running"; errorCode?: string; created: number; updated: number; id?: string }>) {
+async function jobs(
+  entries: Array<{ status: "failed" | "succeeded" | "running"; errorCode?: string; created: number; updated: number; id?: string; model?: string }>,
+) {
   const store = await JobStore.open(paths.db);
   const ids: string[] = [];
   try {
     for (const entry of entries) {
-      const { id } = store.create({ prompt: "question", model: "gpt-5-5-pro", reasoning: "extended", options: {} });
+      const { id } = store.create({ prompt: "question", model: entry.model ?? "gpt-5-5-pro", reasoning: "extended", options: {} });
       if (entry.status !== "running") {
         store.markRunning(id);
         if (entry.status === "failed") {
@@ -164,6 +166,23 @@ describe("usage-limit watch", () => {
     expect(sent.mail[0]).not.toContain("question");
     expect(sent.ntfy).toEqual([{ body: expect.stringContaining("usage limit lifted"), headers: { Tags: "white_check_mark", Title: "watch host" } }]);
     expect(sent.ntfy[0].body).not.toContain("tester");
+  });
+
+  test("a success on a cheaper model does not end a limit on the refused model", async () => {
+    await jobs([{ status: "failed", errorCode: "usage_limit", created: 31, updated: 30 }]);
+    await watch();
+
+    await jobs([{ status: "succeeded", created: 10, updated: 5, model: "gpt-5-5" }]);
+    await watch();
+    expect(sent.mail.map((mail) => mail.match(/Subject: .*/)?.[0])).toEqual(["Subject: ChatGPT usage limit hit"]);
+    expect(sent.ntfy).toHaveLength(1);
+
+    await jobs([{ status: "succeeded", created: 4, updated: 2 }]);
+    await watch();
+    expect(sent.mail.map((mail) => mail.match(/Subject: .*/)?.[0])).toEqual([
+      "Subject: ChatGPT usage limit hit",
+      "Subject: ChatGPT usage limit lifted",
+    ]);
   });
 
   test("stays quiet about a limit that ended before it was announced", async () => {

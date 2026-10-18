@@ -269,7 +269,7 @@ When the account's usage limit is reached, ChatGPT refuses every request with `U
 
 `scripts/pro-cli-limit-watch.ts` notices the limit and probes until it lifts:
 - **Probes:** it sends one probe an hour ("Reply with OK only.", temporary chat, the same model and effort as the refused job). ChatGPT refuses each probe at once while the limit lasts; the probe that finds the limit lifted costs one small request.
-- **Lifted:** the limit counts as lifted when any job created after the latest refusal succeeds.
+- **Lifted:** the limit counts as lifted when a job on the refused model, created after the latest refusal, succeeds. A limit can cover only the Pro model while cheaper models still work, so their successes don't count.
 - **Notices:** it sends one notice when a limit is hit and one when it lifts, by email (any `sendmail -t` compatible command, such as msmtp) and/or by a [ntfy](https://ntfy.sh) POST. Each limit gets one notice of each kind, and a failed send is retried on the next run.
 
 Setup:

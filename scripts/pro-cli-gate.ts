@@ -476,8 +476,9 @@ async function putFile(cfg: GateConfig, name: string, io: GateIO): Promise<Recor
 }
 
 /**
- * The pause after the account's latest usage-limit refusal, if it still runs. A job created after
- * that refusal and succeeding ends it early. A missing or unreadable database never pauses requests.
+ * The pause after the account's latest usage-limit refusal, if it still runs. A job on the refused
+ * model, created after that refusal, that succeeds ends it early; a cheaper model working says
+ * nothing about a Pro limit. A missing or unreadable database never pauses requests.
  */
 export function usageLimitPause(cfg: GateConfig, now = Date.now()): { refusedAt: string; retryAfter: string } | null {
   if (!cfg.jobsDb) return null;
@@ -486,14 +487,15 @@ export function usageLimitPause(cfg: GateConfig, now = Date.now()): { refusedAt:
     db = new Database(cfg.jobsDb, { readonly: true });
     const refused = db
       .query(
-        `SELECT MAX(updated_at) AS at FROM jobs
-         WHERE status = 'failed' AND json_extract(error_json, '$.details.errorCode') = 'usage_limit'`,
+        `SELECT updated_at AS at, model FROM jobs
+         WHERE status = 'failed' AND json_extract(error_json, '$.details.errorCode') = 'usage_limit'
+         ORDER BY updated_at DESC LIMIT 1`,
       )
-      .get() as { at: string | null } | null;
-    if (!refused?.at) return null;
+      .get() as { at: string; model: string } | null;
+    if (!refused) return null;
     const succeeded = db
-      .query("SELECT COUNT(*) AS n FROM jobs WHERE status = 'succeeded' AND created_at > ?")
-      .get(refused.at) as { n: number };
+      .query("SELECT COUNT(*) AS n FROM jobs WHERE status = 'succeeded' AND model = ? AND created_at > ?")
+      .get(refused.model, refused.at) as { n: number };
     if (succeeded.n > 0) return null;
     const retryAt = Date.parse(refused.at) + (cfg.usageLimitPauseMs ?? USAGE_LIMIT_PAUSE_MS);
     return retryAt > now ? { refusedAt: refused.at, retryAfter: new Date(retryAt).toISOString() } : null;

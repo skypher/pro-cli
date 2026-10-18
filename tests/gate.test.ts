@@ -450,13 +450,15 @@ test("audit log records error codes of failed calls, not messages", async () => 
 
 describe("usage-limit pause", () => {
   // A job database whose jobs failed or succeeded at the given times (ISO strings).
-  async function jobsDb(jobs: Array<{ status: "failed" | "succeeded"; errorCode?: string; createdAt: string; updatedAt: string }>) {
+  async function jobsDb(
+    jobs: Array<{ status: "failed" | "succeeded"; errorCode?: string; createdAt: string; updatedAt: string; model?: string }>,
+  ) {
     const path = join(root, "jobs.sqlite");
     const store = await JobStore.open(path);
     const ids: string[] = [];
     try {
       for (const entry of jobs) {
-        const { id } = store.create({ prompt: "question", model: "gpt-5-5-pro", reasoning: "standard", options: {} });
+        const { id } = store.create({ prompt: "question", model: entry.model ?? "gpt-5-5-pro", reasoning: "standard", options: {} });
         store.markRunning(id);
         if (entry.status === "failed") {
           store.markFailed(id, new ProError("UPSTREAM_ERROR", "You've hit your limit.", { details: { errorCode: entry.errorCode ?? null } }));
@@ -521,6 +523,14 @@ describe("usage-limit pause", () => {
       expect((await gate("pro-cli job create --json hello")).code).toBe(0);
       expect(calls).toHaveLength(before + 1);
     }
+  });
+
+  test("a success on a cheaper model does not end the pause", async () => {
+    await jobsDb([
+      { status: "failed", errorCode: "usage_limit", createdAt: ago(6), updatedAt: ago(5) },
+      { status: "succeeded", createdAt: ago(4), updatedAt: ago(1), model: "gpt-5-5" },
+    ]);
+    expect((await gate("pro-cli job create --json hello")).error).toBe("USAGE_LIMIT_PAUSED");
   });
 
   test("a job that started before the refusal and succeeds later does not end the pause", async () => {

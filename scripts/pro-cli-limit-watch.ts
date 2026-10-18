@@ -12,12 +12,15 @@
 // writes no state, and prints what it would do.
 //
 // When a limit is hit and when it lifts:
-// - Hit: the newest job that failed with details.errorCode = usage_limit has no job created
-//   after it that succeeded. ChatGPT gives no reset time.
+// - Hit: the newest job that failed with details.errorCode = usage_limit has no job on the
+//   same model created after it that succeeded. ChatGPT gives no reset time. The limit can
+//   cover only one model (Pro) while cheaper models still work, so only a success on the
+//   refused model counts.
 // - Probe: once an hour has passed with no newer refusal and no probe, the watch sends one
 //   ("Reply with OK only.", temporary chat, the refused job's model and effort). ChatGPT
 //   refuses it at once while the limit lasts.
-// - Lifted: any job created after the latest refusal succeeds, whether a probe or not.
+// - Lifted: a job on the refused model, created after the latest refusal, succeeds, whether a
+//   probe or not.
 // A limit episode runs from its first refusal to that success. Each episode gets a "hit"
 // notice and, once announced, a "lifted" notice. Each channel is tracked separately, so a
 // failed send is retried on the next run and a delivered one is never repeated.
@@ -106,15 +109,15 @@ async function watch(db: Database, config: LimitWatchConfig, paths: LimitWatchPa
     .get() as { at: string; model: string; reasoning: string } | null;
   if (!latest) return;
   const state = await loadState(paths.state);
-  const episode = await episodeOf(db, latest.at, config, paths);
+  const episode = await episodeOf(db, latest.at, latest.model, config, paths);
   const imposed = state.imposed ?? null;
   const lifted = state.lifted ?? null;
   if (lifted?.episode === episode.start && lifted.mail && lifted.ntfy) return;
   const save = () => (deps.dryRun ? Promise.resolve() : saveState(paths.state, state));
 
   const succeeded = db
-    .query("SELECT id, updated_at AS at FROM jobs WHERE status = 'succeeded' AND created_at > ? ORDER BY updated_at LIMIT 1")
-    .get(latest.at) as { id: string; at: string } | null;
+    .query("SELECT id, updated_at AS at FROM jobs WHERE status = 'succeeded' AND model = ? AND created_at > ? ORDER BY updated_at LIMIT 1")
+    .get(latest.model, latest.at) as { id: string; at: string } | null;
   if (succeeded) {
     // Only an announced episode gets a "lifted" notice, so old episodes stay quiet.
     if (imposed?.episode !== episode.start) return;
@@ -163,12 +166,18 @@ async function watch(db: Database, config: LimitWatchConfig, paths: LimitWatchPa
   await save();
 }
 
-/** The first refusal since the last success before the latest refusal, and what failed since. */
-async function episodeOf(db: Database, refusedAt: string, config: LimitWatchConfig, paths: LimitWatchPaths): Promise<Episode> {
-  const lastSuccess = (db.query("SELECT MAX(updated_at) AS at FROM jobs WHERE status = 'succeeded' AND updated_at <= ?")
-    .get(refusedAt) as { at: string | null }).at;
-  const refused = db.query(`SELECT MIN(updated_at) AS start, COUNT(*) AS n FROM jobs WHERE ${REFUSED} AND updated_at > ?`)
-    .get(lastSuccess ?? "") as { start: string; n: number };
+/** On the refused model: the first refusal since the last success before the latest refusal, and what failed since. */
+async function episodeOf(
+  db: Database,
+  refusedAt: string,
+  model: string,
+  config: LimitWatchConfig,
+  paths: LimitWatchPaths,
+): Promise<Episode> {
+  const lastSuccess = (db.query("SELECT MAX(updated_at) AS at FROM jobs WHERE status = 'succeeded' AND model = ? AND updated_at <= ?")
+    .get(model, refusedAt) as { at: string | null }).at;
+  const refused = db.query(`SELECT MIN(updated_at) AS start, COUNT(*) AS n FROM jobs WHERE ${REFUSED} AND model = ? AND updated_at > ?`)
+    .get(model, lastSuccess ?? "") as { start: string; n: number };
   const failed = (db.query("SELECT id FROM jobs WHERE status = 'failed' AND created_at > ?").all(lastSuccess ?? "") as Array<{ id: string }>)
     .map((row) => row.id);
   const gateFailed = [];
