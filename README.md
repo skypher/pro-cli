@@ -263,6 +263,33 @@ Returns:
 
 ChatGPT does not expose a standalone limits endpoint, so counters refresh whenever you make a real Pro call. General Pro chat throttling is adaptive and not exposed by any endpoint we found.
 
+### Usage-limit watch
+
+When the account's usage limit is reached, ChatGPT refuses every request with `UPSTREAM_ERROR` and `details.errorCode: usage_limit` ("You've hit your limit. Please try again later."), and it gives no reset time.
+
+`scripts/pro-cli-limit-watch.ts` notices the limit and probes until it lifts:
+- **Probes:** it sends one probe an hour ("Reply with OK only.", temporary chat, the same model and effort as the refused job). ChatGPT refuses each probe at once while the limit lasts; the probe that finds the limit lifted costs one small request.
+- **Lifted:** the limit counts as lifted when any job created after the latest refusal succeeds.
+- **Notices:** it sends one notice when a limit is hit and one when it lifts, by email (any `sendmail -t` compatible command, such as msmtp) and/or by a [ntfy](https://ntfy.sh) POST. Each limit gets one notice of each kind, and a failed send is retried on the next run.
+
+Setup:
+
+```sh
+cp scripts/limit-watch.example.json ~/.pro-cli/limit-watch.json   # fill in; a blank field turns that channel off
+mkdir -p ~/.local/state/pro-cli-limit-watch
+cp scripts/systemd/pro-cli-limit-watch.{service,timer} ~/.config/systemd/user/   # adjust the bun and checkout paths
+systemctl --user daemon-reload && systemctl --user enable --now pro-cli-limit-watch.timer
+bun scripts/pro-cli-limit-watch.ts --dry-run   # shows what it would do, without sending anything
+```
+
+The config fields:
+- `mail.to`, `mail.from` and `mail.command` set up email.
+- `ntfy.url` and `ntfy.title` set up ntfy.
+- `gateKeys` lists SSH gate keys whose failed jobs the "lifted" email counts.
+- `probeEveryMinutes` sets the probe interval (0 turns probing off); `probePrompt` sets the probe text.
+
+The watch logs one line per event to `~/.local/state/pro-cli-limit-watch/watch.log` and never reads prompt or answer text. After a refusal, the SSH gate also refuses new requests for 30 minutes (`USAGE_LIMIT_PAUSED`).
+
 ## Conversations
 
 New `ask` and `job create` requests default to temporary ChatGPT conversations. Use `--save` when the turn should be written to ChatGPT history.

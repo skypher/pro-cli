@@ -1,0 +1,10 @@
+# Copy to ~/.config/systemd/user/ together with the .timer; adjust the bun and checkout paths.
+[Unit]
+Description=pro-cli usage-limit watch
+
+[Service]
+Type=oneshot
+ExecStart=%h/.bun/bin/bun %h/pro-cli/scripts/pro-cli-limit-watch.ts
+StandardOutput=append:%h/.local/state/pro-cli-limit-watch/watch.log
+StandardError=append:%h/.local/state/pro-cli-limit-watch/watch.log
+TimeoutStartSec=300

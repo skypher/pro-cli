@@ -1,0 +1,7 @@
+{
+  "mail": { "to": "", "from": "", "command": ["sendmail", "-t"] },
+  "ntfy": { "url": "", "title": "" },
+  "gateKeys": [],
+  "probeEveryMinutes": 60,
+  "probePrompt": "Reply with OK only."
+}
