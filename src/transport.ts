@@ -23,6 +23,10 @@ const DEFAULT_IMAGE_POLL_MS = 3_000;
 const DEFAULT_IMAGE_RATE_LIMIT_POLL_MS = 30_000;
 const BROWSER_STREAM_MARGIN_MS = 2 * 60_000;
 const STREAM_RECOVERY_POLL_MS = 15_000;
+const MAX_ANSWER_FETCH_BACKOFF_MS = 5 * 60_000;
+// How long a --delete-conversation job keeps retrying rate-limited reads of the stored
+// answer before it falls back to the streamed answer and deletes the chat.
+const STORED_ANSWER_TRANSIENT_LIMIT_MS = 15 * 60_000;
 // Without --timeout, a job waits this long in total for a Pro answer; long Pro
 // runs can take well over an hour.
 const DEFAULT_ANSWER_WAIT_MS = 3 * 60 * 60_000;
@@ -1258,7 +1262,7 @@ function readResponse(
   let deepResearchWidget: ResearchTask | null = null;
   let conversationId: string | null = null;
   let completed = false;
-  const state: ResponseParseState = { acceptsTextContinuation: false, lastAppendText: null, inProgressNote: false };
+  const state: ResponseParseState = { acceptsTextContinuation: false, inProgressNote: false };
 
   let boundary = buffer.indexOf("\n\n");
   while (boundary !== -1) {
@@ -1482,7 +1486,13 @@ async function writeStreamDiagnostics(
   dir: string | undefined,
   job: JobRecord,
   code: string,
-  summary: StreamSummary & { streamedChars?: number; storedChars?: number; streamedIsPrefix?: boolean },
+  summary: StreamSummary & {
+    streamedChars?: number;
+    storedChars?: number;
+    streamedIsPrefix?: boolean;
+    firstDifferenceAt?: number;
+    recovery?: ConversationAnswerRecovery;
+  },
 ): Promise<string | null> {
   if (!dir) return null;
   try {
@@ -1502,12 +1512,14 @@ interface ConversationAnswerFetchResult {
   state: "done" | "pending" | "empty" | "incomplete";
   text: string | null;
   message: string | null;
+  retryAfterMs?: number | null;
 }
 
 interface ConversationAnswerRecovery {
   state: "done" | "pending" | "empty" | "incomplete" | "unavailable" | "timeout" | "error";
   status?: number;
   polls: number;
+  transient?: number;
   message?: string | null;
   error?: string;
 }
@@ -1588,7 +1600,15 @@ async function preferStoredAnswer(
     deadline: context.requestStartedAt + answerWaitMs,
     pollMs: integerOption(context.options.streamRecoveryPollMs, STREAM_RECOVERY_POLL_MS, 0, 60_000)
       ?? STREAM_RECOVERY_POLL_MS,
+    transientLimitMs: STORED_ANSWER_TRANSIENT_LIMIT_MS,
   });
+  if (stored.text === null) {
+    await writeStreamDiagnostics(context.options.diagnosticsDir, job, "STORED_ANSWER_UNAVAILABLE", {
+      ...summarizeConversationStream(rawStream),
+      streamedChars: streamedText.length,
+      recovery: stored.recovery,
+    });
+  }
   if (stored.text === null || stored.text === streamedText) {
     validateCompletedResult(job, streamedText);
     return streamedText;
@@ -1598,28 +1618,48 @@ async function preferStoredAnswer(
     streamedChars: streamedText.length,
     storedChars: stored.text.length,
     streamedIsPrefix: stored.text.startsWith(streamedText),
+    firstDifferenceAt: firstDifference(streamedText, stored.text),
   });
   validateCompletedResult(job, stored.text);
   return stored.text;
+}
+
+function firstDifference(a: string, b: string): number {
+  const length = Math.min(a.length, b.length);
+  for (let index = 0; index < length; index += 1) {
+    if (a[index] !== b[index]) return index;
+  }
+  return length;
+}
+
+// Rate limits and server errors on the conversation fetch pass; with ten jobs polling,
+// ChatGPT answers some fetches with 429. Back off and keep polling instead of giving up.
+function isTransientAnswerFetchStatus(status: number): boolean {
+  return status === 200 || status === 408 || status === 429 || status >= 500;
 }
 
 async function pollConversationAnswer(
   conversationId: string,
   evaluate: PageEvaluator,
   cdpBase: string,
-  options: { notBefore: number; deadline: number; pollMs: number },
+  options: { notBefore: number; deadline: number; pollMs: number; transientLimitMs?: number },
 ): Promise<{ text: string | null; recovery: ConversationAnswerRecovery }> {
   let polls = 0;
   let failures = 0;
+  let transient = 0;
+  let streak = 0;
+  let transientSince: number | null = null;
   let last: ConversationAnswerFetchResult | null = null;
   while (true) {
     polls += 1;
+    let fetched: ConversationAnswerFetchResult | null = null;
     try {
-      last = await evaluate<ConversationAnswerFetchResult>(
+      fetched = await evaluate<ConversationAnswerFetchResult>(
         cdpBase,
         buildConversationAnswerFetchExpression(conversationId, options.notBefore / 1000),
         30_000,
       );
+      last = fetched;
       failures = 0;
     } catch (error) {
       failures += 1;
@@ -1633,8 +1673,28 @@ async function pollConversationAnswer(
     if (last && last.ok && (last.state === "empty" || last.state === "incomplete")) {
       return { text: null, recovery: { state: last.state, status: last.status, polls, message: last.message } };
     }
-    if (last && !last.ok && (last.status !== 404 || polls >= 3)) {
-      return { text: null, recovery: { state: "unavailable", status: last.status, polls } };
+    if (fetched && !fetched.ok && isTransientAnswerFetchStatus(fetched.status)) {
+      transient += 1;
+      streak += 1;
+      transientSince ??= Date.now();
+      const waitMs = Math.min(
+        MAX_ANSWER_FETCH_BACKOFF_MS,
+        Math.max(fetched.retryAfterMs ?? 0, options.pollMs * 2 ** Math.min(streak - 1, 5)),
+      );
+      const overLimit = options.transientLimitMs !== undefined
+        && Date.now() - transientSince + waitMs > options.transientLimitMs;
+      if (overLimit || Date.now() + waitMs > options.deadline) {
+        return { text: null, recovery: { state: "unavailable", status: fetched.status, polls, transient } };
+      }
+      await sleep(waitMs);
+      continue;
+    }
+    if (fetched?.ok) {
+      streak = 0;
+      transientSince = null;
+    }
+    if (fetched && !fetched.ok && (fetched.status !== 404 || polls >= 3)) {
+      return { text: null, recovery: { state: "unavailable", status: fetched.status, polls, ...(transient ? { transient } : {}) } };
     }
     if (Date.now() + options.pollMs > options.deadline) {
       return {
@@ -1670,7 +1730,15 @@ function buildConversationAnswerFetchExpression(conversationId: string, notBefor
     );
     const body = (await response.json().catch(() => null)) as { mapping?: unknown; current_node?: unknown } | null;
     if (!response.ok || !body || typeof body !== "object") {
-      return { ok: false, status: response.status, state: "pending", text: null, message: null };
+      const retryAfter = Number(response.headers.get("retry-after"));
+      return {
+        ok: false,
+        status: response.status,
+        state: "pending",
+        text: null,
+        message: null,
+        retryAfterMs: Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : null,
+      };
     }
     const mapping = body.mapping && typeof body.mapping === "object"
       ? body.mapping as Record<string, { message?: unknown }>
@@ -3101,15 +3169,13 @@ function isResearchTaskFailed(status: string): boolean {
 
 interface ResponseParseState {
   acceptsTextContinuation: boolean;
-  lastAppendText: string | null;
   inProgressNote: boolean;
 }
 
+// Appended chunks are kept as sent: answers repeat chunks ("\n\n", " |") all the time,
+// so dropping a chunk that matches the previous one or the text's end corrupts them.
 function mergeStreamText(current: string | null, next: string, append: boolean): string {
-  if (append) {
-    if (current && (current === next || current.endsWith(next))) return current;
-    return `${current ?? ""}${next}`;
-  }
+  if (append) return `${current ?? ""}${next}`;
   if (current && current.length > next.length && current.endsWith(next)) return current;
   return next;
 }
@@ -3228,16 +3294,18 @@ function readMessageContentText(message: unknown): string | null {
   return parts.join("");
 }
 
+// In delta streams a bare {"v": "..."} frame continues the previous append. Typed
+// events (title_generation, message_marker, url_moderation, ...) are not deltas and
+// arrive between them, so they must not end the continuation: saved chats send
+// title_generation part way through the answer.
 function readPatchAppendText(event: Record<string, unknown>, state: ResponseParseState): string | null {
+  if (typeof event.type === "string") return null;
   if (event.o === "append" && isMessageContentPartPath(event.p) && typeof event.v === "string") {
     state.acceptsTextContinuation = true;
-    return readNewAppendText(event.v, state);
+    return event.v;
   }
-  if (typeof event.v === "string" && state.acceptsTextContinuation) {
-    return readNewAppendText(event.v, state);
-  }
+  if (typeof event.v === "string" && state.acceptsTextContinuation) return event.v;
   state.acceptsTextContinuation = false;
-  state.lastAppendText = null;
   if (event.o !== "patch" || !Array.isArray(event.v)) return null;
   const chunks = event.v
     .filter((patch): patch is { o: unknown; p: unknown; v: unknown } => Boolean(patch) && typeof patch === "object")
@@ -3250,17 +3318,11 @@ function readPatchAppendText(event: Record<string, unknown>, state: ResponsePars
     .map((patch) => patch.v);
   if (chunks.length === 0) return null;
   state.acceptsTextContinuation = true;
-  return readNewAppendText(chunks.join(""), state);
+  return chunks.join("");
 }
 
 function isMessageContentPartPath(path: unknown): boolean {
   return typeof path === "string" && /^\/message\/content\/parts\/\d+$/.test(path);
-}
-
-function readNewAppendText(text: string, state: ResponseParseState): string | null {
-  if (text === state.lastAppendText) return null;
-  state.lastAppendText = text;
-  return text;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
