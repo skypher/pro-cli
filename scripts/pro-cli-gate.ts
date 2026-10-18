@@ -84,6 +84,7 @@ const BOOLEAN_FLAGS = new Set([
   "keep-conversation",
   "delete-conversation",
   "chat-only",
+  "pro-only",
   "wait",
   "help",
   "version",
@@ -375,8 +376,8 @@ export async function checkProCliArgs(
     argv.push(flag.value === true ? `--${flag.name}` : `--${flag.name}=${flag.value}`);
   }
   if (github) argv.push("--save", "--delete-conversation", `--preamble=${GITHUB_PREAMBLE}`);
-  // Deep Research and image generation are not offered through the gate.
-  if (spec.kind === "ask" || spec.kind === "odds" || spec.kind === "job create") argv.push("--chat-only");
+  // Only Pro chat models are offered through the gate: no cheaper models, Deep Research or images.
+  if (spec.kind === "ask" || spec.kind === "odds" || spec.kind === "job create") argv.push("--chat-only", "--pro-only");
   argv.push("--json");
   if (spec.kind === "job list") {
     // Fetch the newest jobs and filter to this key afterwards.
@@ -575,7 +576,8 @@ const HELP = `pro-cli gate. Commands:
   ls                                   list inbox files
   rm <name>                            delete an inbox file
 Files for --attach, --instructions-file and @name must be uploaded with put first.
-Chat models only: Deep Research and image generation are not available.
+Pro chat models only: ask, odds and job create refuse other models (INVALID_ARGS);
+Deep Research and image generation are not available.
 When ChatGPT refuses a request because the account's usage limit is reached, ask, odds and
 job create fail with USAGE_LIMIT_PAUSED for 30 minutes (until details.retryAfter) without
 reaching ChatGPT.

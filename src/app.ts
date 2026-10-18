@@ -37,6 +37,7 @@ import { JobStore, redactJob } from "./jobs";
 import { fetchAccountSummary } from "./limits";
 import {
   canonicalModelId,
+  isProModel,
   listModels,
   modelRequiresSavedConversation,
   modelUsesThinkingEffort,
@@ -221,6 +222,7 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
         const askReasoning = resolveRequestReasoning(askModel, parsed.flags, config.defaultReasoning);
         const askOptions = await collectRequestOptions(parsed.flags, io.cwd, ASK_REQUEST_FLAGS, "ask");
         rejectNonChatModel(parsed.flags, askModel);
+        rejectNonProModel(parsed.flags, askModel);
         applyModelConversationRequirements(askOptions, parsed.flags, askModel);
         validateConversationDeletion(askOptions, askModel);
         applyModelTimeoutDefaults(askOptions, parsed.flags, askModel);
@@ -296,6 +298,7 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
         );
         const oddsModel = resolveModel(flagString(parsed.flags, "model") ?? config.defaultModel ?? DEFAULT_MODEL);
         rejectNonChatModel(parsed.flags, oddsModel);
+        rejectNonProModel(parsed.flags, oddsModel);
         applyModelConversationRequirements(baseRequestOptions, parsed.flags, oddsModel);
         applyModelTimeoutDefaults(baseRequestOptions, parsed.flags, oddsModel);
         const result = await runOdds({
@@ -356,6 +359,7 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
           const jobModel = resolveModel(flagString(parsed.flags, "model") ?? config.defaultModel ?? DEFAULT_MODEL);
           const jobOptions = await collectRequestOptions(parsed.flags, io.cwd, JOB_CREATE_FLAGS, "job create");
           rejectNonChatModel(parsed.flags, jobModel);
+          rejectNonProModel(parsed.flags, jobModel);
           applyModelConversationRequirements(jobOptions, parsed.flags, jobModel);
           validateConversationDeletion(jobOptions, jobModel);
           applyModelTimeoutDefaults(jobOptions, parsed.flags, jobModel);
@@ -888,6 +892,7 @@ const ASK_REQUEST_FLAGS = new Set([
   "delete-conversation",
   "preamble",
   "chat-only",
+  "pro-only",
   "cdp",
   "port",
   "schema",
@@ -930,6 +935,7 @@ const ODDS_REQUEST_FLAGS = new Set([
   "parse-retries",
   "allow-fifty",
   "chat-only",
+  "pro-only",
 ]);
 
 function resolveAggregate(value: string): AggregateMethod {
@@ -1023,6 +1029,14 @@ function rejectNonChatModel(flags: Map<string, string | boolean | string[]>, mod
   if (!flagBoolean(flags, "chat-only") || !modelRequiresSavedConversation(model)) return;
   throw invalidArgs(`--model ${canonicalModelId(model)} is not available here; only chat models are.`, [
     "Pick a chat model from pro-cli models.",
+  ]);
+}
+
+/** --pro-only limits a request to Pro chat models, under any alias. */
+function rejectNonProModel(flags: Map<string, string | boolean | string[]>, model: string): void {
+  if (!flagBoolean(flags, "pro-only") || isProModel(model)) return;
+  throw invalidArgs(`--model ${canonicalModelId(model)} is not available here; only Pro models are.`, [
+    "Use a Pro model (for example --model gpt-5-6-pro), or omit --model for the default.",
   ]);
 }
 

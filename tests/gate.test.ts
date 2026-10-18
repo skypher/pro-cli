@@ -187,7 +187,7 @@ describe("gate commands", () => {
     const result = await gate("pro-cli ask --model gpt-5-5 'what is 2+2' -- --cdp=x");
     expect(result.code).toBe(0);
     expect(calls).toHaveLength(1);
-    expect(calls[0].argv).toEqual(["/fake/bun", "/fake/cli.ts", "ask", "--model=gpt-5-5", "--chat-only", "--json", "--", "what is 2+2", "--cdp=x"]);
+    expect(calls[0].argv).toEqual(["/fake/bun", "/fake/cli.ts", "ask", "--model=gpt-5-5", "--chat-only", "--pro-only", "--json", "--", "what is 2+2", "--cdp=x"]);
     expect(calls[0].cwd).toBe(inbox());
     expect(calls[0].env).toEqual(cfg.env);
 
@@ -211,6 +211,7 @@ describe("--github", () => {
       "--delete-conversation",
       preambleArg(calls[0].argv),
       "--chat-only",
+      "--pro-only",
       "--json",
       "--",
       "read owner/repo",
@@ -394,13 +395,14 @@ describe("inbox verbs", () => {
 });
 
 describe("chat models only", () => {
-  test("ask, odds and job create always carry --chat-only", async () => {
-    for (const line of ["pro-cli ask --model image 'a cat'", "pro-cli odds 'will it rain'", "pro-cli job create --model deep-research hello"]) {
+  test("ask, odds and job create always carry --chat-only and --pro-only", async () => {
+    for (const line of ["pro-cli ask --model image 'a cat'", "pro-cli odds 'will it rain'", "pro-cli job create --model gpt-5-6-thinking hello"]) {
       await gate(line);
     }
-    expect(calls.map((call) => call.argv.includes("--chat-only"))).toEqual([true, true, true]);
+    expect(calls.map((call) => call.argv.includes("--chat-only") && call.argv.includes("--pro-only"))).toEqual([true, true, true]);
     await gate("pro-cli job list");
     expect(calls[3].argv).not.toContain("--chat-only");
+    expect(calls[3].argv).not.toContain("--pro-only");
   });
 
   test("get is not a command", async () => {

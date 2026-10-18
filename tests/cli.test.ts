@@ -680,6 +680,32 @@ describe("robot-mode CLI", () => {
     });
   });
 
+  test("--pro-only refuses every model but Pro chat models, under any alias", async () => {
+    await withHome(async (home) => {
+      const run_ = (command: string[], model?: string) =>
+        run([...command, "hello", "--no-start", "--chat-only", "--pro-only", ...(model ? ["--model", model] : []), "--json"].filter(
+          (arg) => command[0] === "job" || arg !== "--no-start",
+        ), { tty: true, home });
+      for (const [command, model] of [
+        [["job", "create"], "gpt-5-6-thinking"],
+        [["job", "create"], "gpt-6"],
+        [["job", "create"], "sol"],
+        [["job", "create"], "gpt-4.5"],
+        [["ask"], "gpt-5-5-thinking"],
+        [["odds"], "luna"],
+      ] as Array<[string[], string]>) {
+        const result = await run_(command, model);
+        expect(result.code).toBe(2);
+        const payload = JSON.parse(result.stderr);
+        expect(payload.error.code).toBe("INVALID_ARGS");
+        expect(payload.error.message).toContain("only Pro models are");
+      }
+      for (const model of ["gpt-6-pro", "GPT-5.5-Pro", "pro", undefined]) {
+        expect((await run_(["job", "create"], model)).code).toBe(0);
+      }
+    });
+  });
+
   test("rejects --delete-conversation unless it deletes a new saved chat-model chat", async () => {
     await withHome(async (home) => {
       const cases: Array<[string[], string]> = [

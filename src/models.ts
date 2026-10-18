@@ -142,6 +142,14 @@ export function reasoningLevelsForModel(model: string): string[] | undefined {
   return capability ? [...capability.reasoningLevels] : undefined;
 }
 
+// Pro models end in "-pro" (gpt-5-5-pro, gpt-6-pro, ...); the static table also marks them.
+// Deep Research and image generation run on Pro but are not chat models.
+export function isProModel(model: string): boolean {
+  const canonical = canonicalModelId(model);
+  if (modelRequiresSavedConversation(canonical)) return false;
+  return canonical.toLowerCase().endsWith("-pro") || STATIC_MODEL_BY_ID.get(canonical)?.reasoningType === "pro";
+}
+
 export function modelRequiresSavedConversation(model: string): boolean {
   const canonical = canonicalModelId(model);
   return canonical === "research" || canonical === "image";
