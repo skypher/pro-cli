@@ -1480,6 +1480,44 @@ describe("ChatGPT transport: cut-off answer streams", () => {
     });
   });
 
+  test("does not take the first response's [DONE] as the end of a handed-off stream that was cut off", async () => {
+    const segments = (rest: string[]) => [
+      'event: delta_encoding\ndata: "v1"',
+      'data: {"type":"resume_conversation_token","token":"t","conversation_id":"conv_handoff"}',
+      'data: {"type":"stream_handoff","conversation_id":"conv_handoff"}',
+      "data: [DONE]",
+      'event: delta_encoding\ndata: "v1"',
+      'event: delta\ndata: {"p":"","o":"add","v":{"message":{"author":{"role":"assistant"},"channel":"final","recipient":"all","content":{"content_type":"text","parts":[""]},"status":"in_progress"},"conversation_id":"conv_handoff"},"c":3}',
+      'event: delta\ndata: {"p":"/message/content/parts/0","o":"append","v":"Partial"}',
+      ...rest,
+      "",
+    ].join("\n\n");
+    await withTokenFile(async (sessionTokenPath) => {
+      let answerFetches = 0;
+      const answerFor = (body: string) => (async <T>(_base: string, script: string): Promise<T> => {
+        if (script.includes("fetchConversationAnswer")) {
+          answerFetches += 1;
+          return { ok: true, status: 200, state: "done", text: "Partial answer, finished.", message: null } as T;
+        }
+        return { ok: true, status: 200, body } as T;
+      });
+
+      expect(await runChatGptJob(job(), { sessionTokenPath, pageEvaluator: answerFor(segments([])), streamRecoveryPollMs: 0 }))
+        .toBe("Partial answer, finished.");
+      expect(answerFetches).toBe(1);
+
+      const complete = segments([
+        'event: delta\ndata: {"v":" answer."}',
+        'event: delta\ndata: {"p":"","o":"patch","v":[{"p":"/message/status","o":"replace","v":"finished_successfully"},{"p":"/message/end_turn","o":"replace","v":true}]}',
+        'data: {"type":"message_stream_complete","conversation_id":"conv_handoff"}',
+        "data: [DONE]",
+      ]);
+      expect(await runChatGptJob(job(), { sessionTokenPath, pageEvaluator: answerFor(complete), streamRecoveryPollMs: 0 }))
+        .toBe("Partial answer.");
+      expect(answerFetches).toBe(1);
+    });
+  });
+
   test("keeps the stream error with diagnostics when the conversation cannot be fetched", async () => {
     await withTokenFile(async (sessionTokenPath) => {
       const diagnosticsDir = await mkdtemp(join(tmpdir(), "pro-stream-diag-"));

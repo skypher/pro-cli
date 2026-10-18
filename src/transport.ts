@@ -1280,7 +1280,7 @@ function readResponse(
     conversationId = extractConversationId(event) ?? conversationId;
     asyncTask = extractAsyncResearchTask(event) ?? asyncTask;
     deepResearchWidget = extractDeepResearchWidgetTask(event, conversationId) ?? deepResearchWidget;
-    completed = completed || parsed.completed;
+    completed = startsStreamSegment(frame) ? false : completed || parsed.completed;
     boundary = buffer.indexOf("\n\n");
   }
 
@@ -1297,7 +1297,7 @@ function readResponse(
     conversationId = extractConversationId(event) ?? conversationId;
     asyncTask = extractAsyncResearchTask(event) ?? asyncTask;
     deepResearchWidget = extractDeepResearchWidgetTask(event, conversationId) ?? deepResearchWidget;
-    completed = completed || parsed.completed;
+    completed = startsStreamSegment(buffer) ? false : completed || parsed.completed;
   }
 
   if (!completed) {
@@ -1324,6 +1324,14 @@ function readResponse(
   }
 
   return { text: completedText ?? "", asyncTask, deepResearchWidget, conversationId };
+}
+
+// The body holds the first response and then the stream it handed off to, each opening
+// with a delta_encoding frame. The first one ends in [DONE] before the answer starts, so
+// only a completion seen in the last stream counts; otherwise a handed-off stream that
+// was cut off would pass as complete.
+function startsStreamSegment(frame: string): boolean {
+  return /^event:\s*delta_encoding\s*$/m.test(frame);
 }
 
 function isRecoverableStreamError(error: ProError): boolean {
