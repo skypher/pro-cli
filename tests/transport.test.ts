@@ -1186,6 +1186,58 @@ describe("ChatGPT transport", () => {
     });
   });
 
+  test("leaves out a progress note's text that follows a finished message added mid-note", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const pageEvaluator = (async <T>(): Promise<T> =>
+        ({
+          ok: true,
+          status: 200,
+          body: [
+            'event: delta_encoding\ndata: "v1"',
+            'event: delta\ndata: {"p":"","o":"add","v":{"message":{"author":{"role":"assistant"},"channel":"commentary","recipient":"all","content":{"content_type":"text","parts":["I am"]},"status":"in_progress"},"conversation_id":"conv_note"},"c":5}',
+            'event: delta\ndata: {"p":"/message/content/parts/0","o":"append","v":" checking"}',
+            'event: delta\ndata: {"p":"","o":"add","v":{"message":{"author":{"role":"assistant"},"channel":"commentary","recipient":"SubAgentActivityThreadItem.completed","content":{"content_type":"text","parts":[""]},"status":"finished_successfully"},"conversation_id":"conv_note"},"c":6}',
+            'event: delta\ndata: {"p":"/message/content/parts/0","o":"append","v":" the"}',
+            'event: delta\ndata: {"v":" files."}',
+            'event: delta\ndata: {"p":"/message/status","o":"replace","v":"finished_successfully"}',
+            'event: delta\ndata: {"p":"","o":"add","v":{"message":{"author":{"role":"assistant"},"channel":"final","recipient":"all","content":{"content_type":"text","parts":[""]},"status":"in_progress"},"conversation_id":"conv_note"},"c":7}',
+            'event: delta\ndata: {"p":"","o":"patch","v":[{"p":"/message/content/parts/0","o":"append","v":"The"},{"p":"/message/metadata/open_thread_summary","o":"add","v":{}}]}',
+            'event: delta\ndata: {"p":"/message/content/parts/0","o":"append","v":" answer"}',
+            'event: delta\ndata: {"p":"","o":"add","v":{"message":{"author":{"role":"assistant"},"channel":"commentary","recipient":"SubAgentActivityThreadItem.completed","content":{"content_type":"text","parts":[""]},"status":"finished_successfully"},"conversation_id":"conv_note"},"c":8}',
+            'event: delta\ndata: {"p":"/message/content/parts/0","o":"append","v":" ends here."}',
+            'event: delta\ndata: {"p":"","o":"patch","v":[{"p":"/message/status","o":"replace","v":"finished_successfully"},{"p":"/message/end_turn","o":"replace","v":true}]}',
+            'data: {"type":"message_stream_complete","conversation_id":"conv_note"}',
+            "data: [DONE]",
+            "",
+          ].join("\n\n"),
+        }) as T);
+
+      const result = await runChatGptJob(job(), { sessionTokenPath, pageEvaluator });
+
+      expect(result).toBe("The answer ends here.");
+    });
+  });
+
+  test("does not take text sent to another recipient as the answer", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const pageEvaluator = (async <T>(): Promise<T> =>
+        ({
+          ok: true,
+          status: 200,
+          body: [
+            'data: {"message":{"author":{"role":"assistant"},"channel":"final","recipient":"all","content":{"content_type":"text","parts":["The answer."]},"status":"finished_successfully","end_turn":true},"conversation_id":"conv_recipient"}',
+            'data: {"message":{"author":{"role":"assistant"},"channel":"commentary","recipient":"SubAgentActivityThreadItem.completed","content":{"content_type":"text","parts":["Sub-agent done."]},"status":"finished_successfully"},"conversation_id":"conv_recipient"}',
+            "data: [DONE]",
+            "",
+          ].join("\n\n"),
+        }) as T);
+
+      const result = await runChatGptJob(job(), { sessionTokenPath, pageEvaluator });
+
+      expect(result).toBe("The answer.");
+    });
+  });
+
   test("maps non-OK upstream responses to structured errors", async () => {
     await withTokenFile(async (sessionTokenPath) => {
       const pageEvaluator = (async <T>(): Promise<T> =>

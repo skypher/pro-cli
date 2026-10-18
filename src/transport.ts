@@ -1473,7 +1473,8 @@ async function deleteJobConversation(
   await appendConversationRecord(options.diagnosticsDir, "undeleted-conversations.jsonl", job, conversationId);
 }
 
-// Deleted chats are only hidden (is_visible: false), so a logged id lets a chat be inspected later.
+// The logged id ties a job to the chat it deleted. A deleted chat (is_visible: false) cannot be
+// read or restored afterwards: both GET and PATCH return 404.
 async function appendConversationRecord(
   dir: string | undefined,
   file: string,
@@ -3235,8 +3236,11 @@ function readConversationEvent(event: unknown, state: ResponseParseState): {
       suggestions: ["Retry later or check usage limits."],
     });
   }
+  // Appends continue the message that is still streaming. ChatGPT adds finished messages
+  // (SubAgentActivityThreadItem) in the middle of a progress note and then sends the rest
+  // of the note, so a finished message must not decide whether appended text is answer.
   const snapshot = readEventMessage(event);
-  if (snapshot) state.inProgressNote = isProgressNote(snapshot);
+  if (snapshot && snapshot.status !== "finished_successfully") state.inProgressNote = isProgressNote(snapshot);
   const patchText = readPatchAppendText(event, state);
   if (patchText !== null) {
     return {
@@ -3268,6 +3272,7 @@ function readConversationMessageText(event: Record<string, unknown>): string | n
   const message = readEventMessage(event);
   const author = message?.author as { role?: unknown } | undefined;
   if (!message || author?.role !== "assistant" || isProgressNote(message)) return null;
+  if (message.recipient !== undefined && message.recipient !== null && message.recipient !== "all") return null;
   return readMessageContentText(message);
 }
 
