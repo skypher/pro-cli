@@ -14,7 +14,7 @@ import {
   resetAuthProfile,
   showProCliChromeWindow,
 } from "./auth";
-import { loadConfig, migrateLegacyDefaultHome, resolvePaths, saveConfig } from "./config";
+import { loadConfig, migrateLegacyDefaultHome, resolvePaths, saveConfig, type ProConfig } from "./config";
 import {
   archiveConversations,
   deleteConversations,
@@ -91,7 +91,7 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
     switch (command) {
       case "setup": {
         const auth = await getAuthStatus(paths);
-        const port = flagString(parsed.flags, "port") ?? "9222";
+        const port = cdpPortFlag(parsed.flags, config) ?? "9222";
         writeSuccess(io, mode, buildSetupGuide(auth, paths.home, port));
         return EXIT.success;
       }
@@ -101,11 +101,11 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
           return EXIT.success;
         }
         if (subcommand === "command") {
-          writeSuccess(io, mode, buildAuthCommand(paths.home, flagString(parsed.flags, "port") ?? "9222"));
+          writeSuccess(io, mode, buildAuthCommand(paths.home, cdpPortFlag(parsed.flags, config) ?? "9222"));
           return EXIT.success;
         }
         if (subcommand === "capture") {
-          const cdpBase = defaultCdpBase(flagString(parsed.flags, "port"), flagString(parsed.flags, "cdp"));
+          const cdpBase = defaultCdpBase(cdpPortFlag(parsed.flags, config), flagString(parsed.flags, "cdp"));
           const jsonPath = flagString(parsed.flags, "out") ?? paths.cookieJsonPath;
           const jarPath = flagString(parsed.flags, "jar") ?? paths.cookieJarPath;
           const tokenPath = flagString(parsed.flags, "token-out") ?? paths.sessionTokenPath;
@@ -126,7 +126,7 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
           return EXIT.success;
         }
         if (subcommand === "reset") {
-          const port = flagString(parsed.flags, "port") ?? "9222";
+          const port = cdpPortFlag(parsed.flags, config) ?? "9222";
           const result = await resetAuthProfile({
             home: paths.home,
             port,
@@ -138,13 +138,13 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
           return EXIT.success;
         }
         if (subcommand === "hide") {
-          const cdpBase = defaultCdpBase(flagString(parsed.flags, "port"), flagString(parsed.flags, "cdp"));
+          const cdpBase = defaultCdpBase(cdpPortFlag(parsed.flags, config), flagString(parsed.flags, "cdp"));
           const result = await hideProCliChromeWindow(cdpBase);
           writeSuccess(io, mode, result);
           return EXIT.success;
         }
         if (subcommand === "show") {
-          const cdpBase = defaultCdpBase(flagString(parsed.flags, "port"), flagString(parsed.flags, "cdp"));
+          const cdpBase = defaultCdpBase(cdpPortFlag(parsed.flags, config), flagString(parsed.flags, "cdp"));
           const result = await showProCliChromeWindow(cdpBase);
           writeSuccess(io, mode, result);
           return EXIT.success;
@@ -159,7 +159,7 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
       }
       case "limits": {
         const cdp = flagString(parsed.flags, "cdp");
-        const port = flagString(parsed.flags, "port");
+        const port = cdpPortFlag(parsed.flags, config);
         const cdpBase = cdp || port ? defaultCdpBase(port, cdp) : undefined;
         const account = await fetchAccountSummary(cdpBase);
         const store = await JobStore.open(paths.dbPath);
@@ -220,7 +220,7 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
         const prompt = await promptFromArgs([subcommand, ...rest].filter(Boolean), io.cwd);
         const askModel = resolveModel(flagString(parsed.flags, "model") ?? config.defaultModel ?? DEFAULT_MODEL);
         const askReasoning = resolveRequestReasoning(askModel, parsed.flags, config.defaultReasoning);
-        const askOptions = await collectRequestOptions(parsed.flags, io.cwd, ASK_REQUEST_FLAGS, "ask");
+        const askOptions = await collectRequestOptions(parsed.flags, io.cwd, ASK_REQUEST_FLAGS, "ask", config);
         rejectNonChatModel(parsed.flags, askModel);
         rejectNonProModel(parsed.flags, askModel);
         applyModelConversationRequirements(askOptions, parsed.flags, askModel);
@@ -295,6 +295,7 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
           io.cwd,
           ODDS_REQUEST_FLAGS,
           "odds",
+          config,
         );
         const oddsModel = resolveModel(flagString(parsed.flags, "model") ?? config.defaultModel ?? DEFAULT_MODEL);
         rejectNonChatModel(parsed.flags, oddsModel);
@@ -357,7 +358,7 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
           }
           const userPrompt = await promptFromArgs(rest, io.cwd);
           const jobModel = resolveModel(flagString(parsed.flags, "model") ?? config.defaultModel ?? DEFAULT_MODEL);
-          const jobOptions = await collectRequestOptions(parsed.flags, io.cwd, JOB_CREATE_FLAGS, "job create");
+          const jobOptions = await collectRequestOptions(parsed.flags, io.cwd, JOB_CREATE_FLAGS, "job create", config);
           rejectNonChatModel(parsed.flags, jobModel);
           rejectNonProModel(parsed.flags, jobModel);
           applyModelConversationRequirements(jobOptions, parsed.flags, jobModel);
@@ -542,7 +543,12 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
         if (subcommand === "get") {
           writeSuccess(io, mode, {
             config,
-            defaults: { model: DEFAULT_MODEL, reasoning: DEFAULT_REASONING, daemonConcurrency: DEFAULT_DAEMON_CONCURRENCY },
+            defaults: {
+              model: DEFAULT_MODEL,
+              reasoning: DEFAULT_REASONING,
+              daemonConcurrency: DEFAULT_DAEMON_CONCURRENCY,
+              cdpPort: 9222,
+            },
             paths: redactPaths(paths),
           });
           return EXIT.success;
@@ -559,7 +565,8 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
               throw invalidArgs("Invalid daemon-concurrency.", [`Use an integer between 1 and ${MAX_DAEMON_CONCURRENCY}.`]);
             }
             next.daemonConcurrency = concurrency;
-          } else throw invalidArgs(`Unknown config key ${key}.`, ["Supported keys: model, reasoning, daemon-concurrency."]);
+          } else if (key === "cdp-port") next.cdpPort = Number(validateCdpPort(value));
+          else throw invalidArgs(`Unknown config key ${key}.`, ["Supported keys: model, reasoning, daemon-concurrency, cdp-port."]);
           await saveConfig(io.env, next);
           writeSuccess(io, mode, { config: next });
           return EXIT.success;
@@ -568,7 +575,7 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
       }
       case "doctor": {
         const auth = await getAuthStatus(paths);
-        const cdpBase = defaultCdpBase(flagString(parsed.flags, "port"), flagString(parsed.flags, "cdp"));
+        const cdpBase = defaultCdpBase(cdpPortFlag(parsed.flags, config), flagString(parsed.flags, "cdp"));
         const browserSession = await getBrowserSessionStatus(
           cdpBase,
           parseIntegerFlag(parsed.flags, "timeout", 3_000, 1, 60_000),
@@ -735,6 +742,11 @@ function buildSetupGuide(auth: Awaited<ReturnType<typeof getAuthStatus>>, home: 
   };
 }
 
+// --port wins over the home's configured CDP port; --cdp wins over both.
+function cdpPortFlag(flags: Map<string, string | boolean | string[]>, config: ProConfig): string | undefined {
+  return flagString(flags, "port") ?? (config.cdpPort === undefined ? undefined : String(config.cdpPort));
+}
+
 function buildAuthCommand(home: string, port: string): Record<string, unknown> {
   validateCdpPort(port);
   const profileDir = join(home, "chrome-profile");
@@ -781,6 +793,7 @@ async function collectRequestOptions(
   cwd: string,
   allowedFlags: Set<string>,
   command: string,
+  config: ProConfig,
 ): Promise<Record<string, unknown>> {
   rejectUnsupportedFlags(flags, allowedFlags, command);
   const options: Record<string, unknown> = {};
@@ -815,7 +828,7 @@ async function collectRequestOptions(
     options.attachments = await resolveAttachments(attachPaths, cwd);
   }
   const cdp = flagString(flags, "cdp");
-  const port = flagString(flags, "port");
+  const port = cdpPortFlag(flags, config);
   if (cdp || port) options.cdpBase = defaultCdpBase(port, cdp);
 
   const instructions = flagString(flags, "instructions");

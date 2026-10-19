@@ -11,6 +11,8 @@ export interface ProConfig {
   defaultReasoning?: string;
   /** Jobs the daemon runs at once; read when the daemon starts. */
   daemonConcurrency?: number;
+  /** CDP port of this home's Chrome, used when no --port or --cdp is given. */
+  cdpPort?: number;
 }
 
 export interface RuntimePaths {
