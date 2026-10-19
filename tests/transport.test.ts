@@ -2205,13 +2205,15 @@ describe("deleteConversation and preamble", () => {
         return { ok: true, status: 200, body: cutOffStream("conv_slow") } as T;
       });
 
-      const result = await runChatGptJob(job(), { sessionTokenPath, pageEvaluator, streamRecoveryPollMs: 10 });
+      const result = await runChatGptJob(job(), { sessionTokenPath, pageEvaluator, streamRecoveryPollMs: 40 });
 
       expect(result).toBe("Recovered answer");
+      // 40 ms growing 1.5x per poll: the fifth gap is at least 40 * 1.5^4 = 202 ms. Load only
+      // lengthens gaps, so only lower bounds are checked, plus that the first gap is shorter.
       const gaps = reads.slice(1).map((at, index) => at - reads[index]);
-      expect(gaps[0]).toBeLessThan(25);
-      expect(gaps[4]).toBeGreaterThanOrEqual(45);
-      expect(gaps[4]).toBeLessThan(80 + 40);
+      expect(gaps[0]).toBeGreaterThanOrEqual(39);
+      expect(gaps[4]).toBeGreaterThanOrEqual(200);
+      expect(gaps[0]).toBeLessThan(gaps[4]);
     });
   });
 
