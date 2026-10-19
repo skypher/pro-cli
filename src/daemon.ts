@@ -15,7 +15,7 @@ import type { CliIO } from "./output";
 const DEFAULT_DAEMON_START_TIMEOUT_MS = 5_000;
 const DEFAULT_DAEMON_POLL_MS = 500;
 const HEARTBEAT_MS = 2_000;
-export const DEFAULT_DAEMON_CONCURRENCY = 3;
+export const DEFAULT_DAEMON_CONCURRENCY = 6;
 export const MAX_DAEMON_CONCURRENCY = 16;
 // Endpoints written by this daemon carry protocol 2; the legacy serial daemon writes none.
 const DAEMON_PROTOCOL = 2;
@@ -86,6 +86,7 @@ interface DaemonRuntimePaths {
 interface DaemonControl {
   pumpQueue: () => void;
   shutdown: (force: boolean) => void;
+  setConcurrency: (concurrency: number) => void;
   info: () => { protocol: number; concurrency: number; activeJobs: number; draining: boolean };
 }
 
@@ -131,6 +132,10 @@ export class DaemonClient {
 
   async shutdown(force = false): Promise<Record<string, unknown>> {
     return this.request("POST", "/shutdown", force ? { force: true } : undefined);
+  }
+
+  async setConcurrency(concurrency: number): Promise<Record<string, unknown>> {
+    return this.request("POST", "/concurrency", { concurrency });
   }
 
   private async request(
@@ -357,6 +362,20 @@ export async function stopLegacyDaemon(
   }
 }
 
+/**
+ * Apply a new concurrency to the running daemon without restarting it. Raising it claims queued jobs at
+ * once; lowering it lets running jobs finish and claims nothing new until fewer are active.
+ * Returns null when no daemon is running.
+ */
+export async function setDaemonConcurrency(
+  paths: RuntimePaths,
+  concurrency: number,
+): Promise<Record<string, unknown> | null> {
+  const connected = await connectDaemon(paths);
+  if (!connected) return null;
+  return connected.client.setConcurrency(concurrency);
+}
+
 export async function stopDaemon(paths: RuntimePaths, options: { force?: boolean } = {}): Promise<DaemonStatus> {
   const connected = await connectDaemon(paths);
   if (connected) {
@@ -393,7 +412,7 @@ export async function runDaemonServer(
   touchPrivateFile(runtime.logPath);
   const token = randomUUID().replace(/-/g, "") + randomUUID().replace(/-/g, "");
   const startedAt = new Date().toISOString();
-  const concurrency = options.concurrency ?? DEFAULT_DAEMON_CONCURRENCY;
+  let concurrency = options.concurrency ?? DEFAULT_DAEMON_CONCURRENCY;
   const owner = `${process.pid}:${randomUUID()}`;
   const store = await JobStore.open(paths.dbPath);
   const active = new Map<string, Promise<void>>();
@@ -423,6 +442,10 @@ export async function runDaemonServer(
           pumpQueue,
           shutdown: (force) => {
             setTimeout(() => void shutdown(force), 10);
+          },
+          setConcurrency: (next) => {
+            concurrency = next;
+            queueMicrotask(pumpQueue);
           },
           info: () => ({ protocol: DAEMON_PROTOCOL, concurrency, activeJobs: active.size, draining }),
         });
@@ -702,6 +725,18 @@ async function routeDaemonRequest(
     const force = body.force === true;
     control.shutdown(force);
     return { state: "stopping", force, activeJobs: control.info().activeJobs };
+  }
+  if (request.method === "POST" && url.pathname === "/concurrency") {
+    const concurrency = (await readJsonBody(request)).concurrency;
+    if (typeof concurrency !== "number" || !Number.isInteger(concurrency) || concurrency < 1 || concurrency > MAX_DAEMON_CONCURRENCY) {
+      throw new ProError("INVALID_ARGS", "Invalid daemon concurrency.", {
+        exitCode: EXIT.invalidArgs,
+        suggestions: [`Use an integer between 1 and ${MAX_DAEMON_CONCURRENCY}.`],
+      });
+    }
+    control.setConcurrency(concurrency);
+    const info = control.info();
+    return { concurrency: info.concurrency, activeJobs: info.activeJobs };
   }
   if (request.method === "POST" && url.pathname === "/jobs") {
     const input = createJobInputFromPayload(await readJsonBody(request));

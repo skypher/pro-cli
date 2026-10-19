@@ -8,6 +8,7 @@ import {
   DaemonClient,
   getDaemonStatus,
   runDaemonServer,
+  setDaemonConcurrency,
   stopDaemon,
   stopLegacyDaemon,
   type DaemonEndpoint,
@@ -60,6 +61,34 @@ describe("concurrent daemon", () => {
       }
       expect(gate.started).toHaveLength(3);
       expect((await client.result(ids[2])).result).toBe("answer three");
+    });
+  });
+
+  test("changes concurrency while running: raising claims queued jobs, lowering lets running ones finish", async () => {
+    const gate = gatedTransport();
+    await withDaemon({ concurrency: 1, transports: gate.transports }, async ({ paths }) => {
+      const client = await clientFor(runtimeFor(paths.home).endpointPath);
+      const ids: string[] = [];
+      for (const prompt of ["one", "two", "three", "four"]) {
+        ids.push(String(((await client.createJob(jobInput(prompt))).job as JobRecord).id));
+      }
+      await until(() => gate.started.length === 1);
+
+      expect(await setDaemonConcurrency(paths, 3)).toMatchObject({ concurrency: 3 });
+      await until(() => gate.started.length === 3);
+      expect((await getDaemonStatus(paths)).concurrency).toBe(3);
+
+      expect(await setDaemonConcurrency(paths, 1)).toMatchObject({ concurrency: 1, activeJobs: 3 });
+      await Bun.sleep(150);
+      expect(gate.started).toHaveLength(3);
+      expect(((await client.status(ids[3])).job as JobRecord).status).toBe("queued");
+
+      await expect(client.setConcurrency(0)).rejects.toThrow("Invalid daemon concurrency");
+
+      gate.release();
+      for (const id of ids) {
+        expect(((await client.wait(id, 5_000, 25)).job as JobRecord).status).toBe("succeeded");
+      }
     });
   });
 

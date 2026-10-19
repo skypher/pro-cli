@@ -336,7 +336,7 @@ describe("robot-mode CLI", () => {
       expect(JSON.parse(set.stdout).data.config.daemonConcurrency).toBe(4);
       const got = JSON.parse((await run(["config", "get", "--json"], { tty: true, home })).stdout);
       expect(got.data.config.daemonConcurrency).toBe(4);
-      expect(got.data.defaults.daemonConcurrency).toBe(3);
+      expect(got.data.defaults.daemonConcurrency).toBe(6);
 
       for (const bad of ["0", "17", "two"]) {
         const rejected = await run(["config", "set", "daemon-concurrency", bad, "--json"], { tty: true, home });

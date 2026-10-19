@@ -26,6 +26,7 @@ import {
   ensureDaemonRunning,
   getDaemonStatus,
   runDaemonServer,
+  setDaemonConcurrency,
   stopDaemon,
   stopLegacyDaemon,
   type DaemonClient,
@@ -562,7 +563,9 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
             next.daemonConcurrency = concurrency;
           } else throw invalidArgs(`Unknown config key ${key}.`, ["Supported keys: model, reasoning, daemon-concurrency."]);
           await saveConfig(io.env, next);
-          writeSuccess(io, mode, { config: next });
+          if (key === "daemon-concurrency") {
+            writeSuccess(io, mode, { config: next, daemon: await applyDaemonConcurrency(paths, next.daemonConcurrency!) });
+          } else writeSuccess(io, mode, { config: next });
           return EXIT.success;
         }
         throw invalidArgs("Unknown config command.", ["Use pro-cli config get or pro-cli config set."]);
@@ -1374,6 +1377,23 @@ function parseIntegerFlag(
     throw invalidArgs(`Invalid --${source}.`, [`Use an integer between ${min} and ${max}.`]);
   }
   return number;
+}
+
+// A running daemon takes the new value at once; one started before live changes existed needs a restart.
+async function applyDaemonConcurrency(paths: ReturnType<typeof resolvePaths>, concurrency: number): Promise<Record<string, unknown>> {
+  try {
+    const applied = await setDaemonConcurrency(paths, concurrency);
+    if (!applied) return { running: false, message: "No daemon is running; the next one starts with this value." };
+    return { running: true, applied: true, ...applied };
+  } catch (error) {
+    const proError = toProError(error);
+    if (proError.code !== "DAEMON_ROUTE_NOT_FOUND") throw proError;
+    return {
+      running: true,
+      applied: false,
+      message: "The running daemon predates live concurrency changes; run pro-cli daemon restart once.",
+    };
+  }
 }
 
 function configuredConcurrency(value: unknown): number | undefined {
