@@ -334,6 +334,7 @@ describe("robot-mode CLI", () => {
       const set = await run(["config", "set", "daemon-concurrency", "4", "--json"], { tty: true, home });
       expect(set.code).toBe(0);
       expect(JSON.parse(set.stdout).data.config.daemonConcurrency).toBe(4);
+      expect(JSON.parse(set.stdout).data.daemon.running).toBe(false);
       const got = JSON.parse((await run(["config", "get", "--json"], { tty: true, home })).stdout);
       expect(got.data.config.daemonConcurrency).toBe(4);
       expect(got.data.defaults.daemonConcurrency).toBe(6);
@@ -342,6 +343,52 @@ describe("robot-mode CLI", () => {
         const rejected = await run(["config", "set", "daemon-concurrency", bad, "--json"], { tty: true, home });
         expect(rejected.code).toBe(EXIT.invalidArgs);
       }
+    });
+  });
+
+  test("config set daemon-concurrency hands the value to a running daemon", async () => {
+    await withHome(async (home) => {
+      await writeDaemonEndpoint(home);
+      const sent: unknown[] = [];
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        const url = new URL(String(input));
+        if (url.pathname === "/health") return Response.json({ ok: true, data: { state: "running", pid: process.pid, home } });
+        if (url.pathname === "/concurrency" && init?.method === "POST") {
+          sent.push(JSON.parse(String(init.body)));
+          return Response.json({ ok: true, data: { concurrency: 5, activeJobs: 2 } });
+        }
+        throw new Error(`unexpected fetch ${url.pathname}`);
+      }) as typeof fetch;
+
+      const set = await run(["config", "set", "daemon-concurrency", "5", "--json"], { tty: true, home });
+      expect(set.code).toBe(0);
+      expect(sent).toEqual([{ concurrency: 5 }]);
+      const payload = JSON.parse(set.stdout);
+      expect(payload.data.config.daemonConcurrency).toBe(5);
+      expect(payload.data.daemon).toEqual({ running: true, applied: true, concurrency: 5, activeJobs: 2 });
+    });
+  });
+
+  test("config set daemon-concurrency saves the value and asks for a restart when the daemon predates live changes", async () => {
+    await withHome(async (home) => {
+      await writeDaemonEndpoint(home);
+      globalThis.fetch = (async (input: RequestInfo | URL): Promise<Response> => {
+        const url = new URL(String(input));
+        if (url.pathname === "/health") return Response.json({ ok: true, data: { state: "running", pid: process.pid, home } });
+        return Response.json(
+          { ok: false, error: { code: "DAEMON_ROUTE_NOT_FOUND", message: `No daemon route for POST ${url.pathname}.` } },
+          { status: 404 },
+        );
+      }) as typeof fetch;
+
+      const set = await run(["config", "set", "daemon-concurrency", "5", "--json"], { tty: true, home });
+      expect(set.code).toBe(0);
+      const payload = JSON.parse(set.stdout);
+      expect(payload.data.daemon.running).toBe(true);
+      expect(payload.data.daemon.applied).toBe(false);
+      expect(payload.data.daemon.message).toContain("pro-cli daemon restart");
+      const got = JSON.parse((await run(["config", "get", "--json"], { tty: true, home })).stdout);
+      expect(got.data.config.daemonConcurrency).toBe(5);
     });
   });
 
