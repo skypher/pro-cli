@@ -397,6 +397,8 @@ Unsupported request flags fail loudly. Errors include `code`, `message`, and `su
 
 `pro-cli` uses a browser session you control. The recommended setup opens a dedicated Chrome profile, captures scoped ChatGPT/OpenAI cookies plus the page session token, and stores them under `~/.pro-cli`.
 
+Once the stored session token is within 30 minutes of expiry, the next job takes the page's current token for the same account and saves it when it lasts longer, so `auth capture` is needed only once and again after a new login. A missing token is never created this way.
+
 Treat `~/.pro-cli` like SSH keys or browser session data. Do not commit it, paste it, sync it, or share it.
 
 The daemon control file lives under `/tmp/pro-cli-*` with a local bearer token and private file mode. It points commands at the daemon; it does not contain ChatGPT cookies or session tokens.

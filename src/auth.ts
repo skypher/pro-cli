@@ -20,7 +20,7 @@ import {
 } from "./cookies";
 import type { RuntimePaths } from "./config";
 import { writePrivateFile } from "./config";
-import { isTokenFresh, loadSessionToken, toSessionTokenExport } from "./session-token";
+import { isTokenFresh, loadSessionToken, PAGE_SESSION_TOKEN_EXPRESSION, toSessionTokenExport } from "./session-token";
 
 export interface AuthStatus {
   status: "missing" | "present";
@@ -328,14 +328,7 @@ export function validateCdpPort(port: string): string {
 async function getSessionAccessTokenFromPage(cdpBase: string, timeoutMs: number): Promise<string> {
   const result = await evaluateInCdpPage<{ status: number; hasAccessToken: boolean; accessToken?: string }>(
     cdpBase,
-    `fetch("/api/auth/session", { credentials: "include" }).then(async (res) => {
-      const json = await res.json().catch(() => null);
-      return {
-        status: res.status,
-        hasAccessToken: typeof json?.accessToken === "string",
-        accessToken: typeof json?.accessToken === "string" ? json.accessToken : undefined
-      };
-    })`,
+    PAGE_SESSION_TOKEN_EXPRESSION,
     timeoutMs,
   );
   if (result.status !== 200 || !result.hasAccessToken || !result.accessToken) {

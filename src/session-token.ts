@@ -9,6 +9,16 @@ export interface SessionTokenExport {
   expiresAt?: string;
 }
 
+/** Evaluated in the ChatGPT page: the HTTP status and current access token of its login session. */
+export const PAGE_SESSION_TOKEN_EXPRESSION = `fetch("/api/auth/session", { credentials: "include" }).then(async (res) => {
+      const json = await res.json().catch(() => null);
+      return {
+        status: res.status,
+        hasAccessToken: typeof json?.accessToken === "string",
+        accessToken: typeof json?.accessToken === "string" ? json.accessToken : undefined
+      };
+    })`;
+
 export function toSessionTokenExport(accessToken: string): SessionTokenExport {
   const expiresMs = jwtExpiryMs(accessToken);
   return {

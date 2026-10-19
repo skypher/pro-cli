@@ -1,13 +1,20 @@
 import { randomUUID } from "node:crypto";
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { evaluateInCdpPage, recoverCookieBloatInCdp } from "./cdp";
+import { writePrivateFile } from "./config";
 import { chatGptOrigins } from "./cookies";
 import { DEFAULT_MODEL, isReasoningLevel } from "./defaults";
 import { EXIT, ProError } from "./errors";
 import type { JobRecord, KeptConversationReason, LimitsObservation } from "./jobs";
 import { canonicalModelId, modelUsesThinkingEffort } from "./models";
-import { isTokenFresh, loadSessionToken } from "./session-token";
+import {
+  isTokenFresh,
+  loadSessionToken,
+  PAGE_SESSION_TOKEN_EXPRESSION,
+  toSessionTokenExport,
+  type SessionTokenExport,
+} from "./session-token";
 
 const CHATGPT_CONVERSATION_ENDPOINT = "https://chatgpt.com/backend-api/f/conversation";
 export const DEFAULT_CDP_BASE = "http://127.0.0.1:9222";
@@ -105,7 +112,7 @@ export interface UploadedAttachment {
 }
 
 export async function runChatGptJob(job: JobRecord, options: TransportOptions): Promise<string> {
-  const session = await loadFreshSession(options.sessionTokenPath);
+  const session = await loadFreshSession(options);
   const retries = integerOption(options.retries, 0, 0, 5) ?? 0;
   const retryDelayMs = integerOption(options.retryDelayMs, 500, 0, 60_000) ?? 500;
   const attachments = await uploadJobAttachments(job, options);
@@ -126,7 +133,7 @@ export async function runChatGptJob(job: JobRecord, options: TransportOptions): 
 }
 
 export async function runChatGptResearchTask(task: ResearchTask, options: TransportOptions): Promise<string> {
-  await loadFreshSession(options.sessionTokenPath);
+  await loadFreshSession(options);
   const retries = integerOption(options.retries, 0, 0, 5) ?? 0;
   const retryDelayMs = integerOption(options.retryDelayMs, 500, 0, 60_000) ?? 500;
   const timeoutMs = integerOption(options.timeoutMs, 0, 0, MAX_REQUEST_TIMEOUT_MS) ?? 0;
@@ -165,8 +172,17 @@ export async function runChatGptResearchTask(task: ResearchTask, options: Transp
   });
 }
 
-async function loadFreshSession(sessionTokenPath: string): Promise<{ accountId: string }> {
-  const session = await loadSessionToken(sessionTokenPath).catch(() => null);
+// Requests carry the page's own access token; the stored copy gives the account id and shows a
+// login was captured with auth capture. Once that copy has less than this left, the page's current
+// token for the same account is used instead, and saved when it lasts longer, so nobody has to
+// rerun auth capture. A missing copy is never created here: that still takes auth capture.
+const SESSION_REFRESH_WINDOW_MS = 30 * 60_000;
+
+async function loadFreshSession(options: TransportOptions): Promise<{ accountId: string }> {
+  let session = await loadSessionToken(options.sessionTokenPath).catch(() => null);
+  if (session && !isTokenFresh(session, SESSION_REFRESH_WINDOW_MS)) {
+    session = (await refreshStoredSessionToken(options, session).catch(() => null)) ?? session;
+  }
   if (!session) {
     throw new ProError("SESSION_TOKEN_MISSING", "No ChatGPT session token is available.", {
       exitCode: EXIT.auth,
@@ -186,6 +202,30 @@ async function loadFreshSession(sessionTokenPath: string): Promise<{ accountId: 
     });
   }
   return { accountId: session.accountId };
+}
+
+/** The page's current token when it belongs to the stored token's account and is still valid. */
+async function refreshStoredSessionToken(
+  options: TransportOptions,
+  stored: SessionTokenExport,
+): Promise<SessionTokenExport | null> {
+  const evaluate = options.pageEvaluator ?? evaluateInCdpPage;
+  const page = await evaluate<{ status?: number; accessToken?: unknown }>(
+    options.cdpBase ?? DEFAULT_CDP_BASE,
+    PAGE_SESSION_TOKEN_EXPRESSION,
+    10_000,
+  );
+  if (page?.status !== 200 || typeof page.accessToken !== "string" || !page.accessToken) return null;
+  const fresh = toSessionTokenExport(page.accessToken);
+  if (!fresh.accountId || fresh.accountId !== stored.accountId || !isTokenFresh(fresh)) return null;
+  const longer = !stored.expiresAt || !fresh.expiresAt || Date.parse(fresh.expiresAt) > Date.parse(stored.expiresAt);
+  if (longer) {
+    // Write then rename: jobs starting together may refresh at the same moment.
+    const temp = `${options.sessionTokenPath}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`;
+    await writePrivateFile(temp, `${JSON.stringify(fresh, null, 2)}\n`);
+    await rename(temp, options.sessionTokenPath);
+  }
+  return fresh;
 }
 
 async function postChatGptJob(

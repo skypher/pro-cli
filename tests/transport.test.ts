@@ -3,7 +3,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, test } from "bun:test";
 import type { JobRecord } from "../src/jobs";
-import { runChatGptJob, runChatGptResearchTask } from "../src/transport";
+import { PAGE_SESSION_TOKEN_EXPRESSION } from "../src/session-token";
+import { runChatGptJob, runChatGptResearchTask, type PageEvaluator } from "../src/transport";
 import { ProError } from "../src/errors";
 
 async function withTokenFile<T>(fn: (path: string) => Promise<T>): Promise<T> {
@@ -1398,7 +1399,7 @@ describe("ChatGPT transport", () => {
 
   test("missing session token throws SESSION_TOKEN_MISSING with auth exit code", async () => {
     try {
-      await runChatGptJob(job(), { sessionTokenPath: "/tmp/nonexistent-token-file.json" });
+      await runChatGptJob(job(), { sessionTokenPath: join(tmpdir(), "pro-cli-test-no-such-token.json"), pageEvaluator: pageMustNotBeRead });
       throw new Error("Expected SESSION_TOKEN_MISSING.");
     } catch (error) {
       expect(error).toBeInstanceOf(ProError);
@@ -1422,13 +1423,19 @@ describe("ChatGPT transport", () => {
         expiresAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
       };
       await writeFile(path, JSON.stringify(expired));
+      const asked: string[] = [];
+      const loggedOutPage = (async <T>(_base: string, script: string): Promise<T> => {
+        asked.push(script);
+        return { status: 401, hasAccessToken: false } as T;
+      });
       try {
-        await runChatGptJob(job(), { sessionTokenPath: path });
+        await runChatGptJob(job(), { sessionTokenPath: path, pageEvaluator: loggedOutPage });
         throw new Error("Expected SESSION_TOKEN_EXPIRED.");
       } catch (error) {
         expect(error).toBeInstanceOf(ProError);
         expect((error as ProError).code).toBe("SESSION_TOKEN_EXPIRED");
       }
+      expect(asked).toEqual([PAGE_SESSION_TOKEN_EXPRESSION]);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -1456,7 +1463,7 @@ describe("ChatGPT transport", () => {
         }),
       );
       try {
-        await runChatGptJob(job(), { sessionTokenPath: path });
+        await runChatGptJob(job(), { sessionTokenPath: path, pageEvaluator: pageMustNotBeRead });
         throw new Error("Expected ACCOUNT_ID_MISSING.");
       } catch (error) {
         expect(error).toBeInstanceOf(ProError);
@@ -1464,6 +1471,75 @@ describe("ChatGPT transport", () => {
       }
     } finally {
       await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("ChatGPT transport: stored session token refresh", () => {
+  // A stored token with minutesLeft to live, and a page whose own token lasts pageMinutes.
+  async function withExpiringToken(
+    minutesLeft: number,
+    page: { minutes: number; account?: string } | null,
+    fn: (path: string, run: () => Promise<string>, requests: string[]) => Promise<void>,
+  ) {
+    const dir = await mkdtemp(join(tmpdir(), "pro-token-refresh-"));
+    const path = join(dir, "token.json");
+    const expiresAt = new Date(Date.now() + minutesLeft * 60_000);
+    await writeFile(path, JSON.stringify({
+      version: 1,
+      generatedAt: new Date().toISOString(),
+      source: "pro-cli-cdp-page",
+      accessToken: jwtFor("acct_test", expiresAt),
+      accountId: "acct_test",
+      expiresAt: expiresAt.toISOString(),
+    }));
+    const requests: string[] = [];
+    const pageEvaluator = (async <T>(_base: string, script: string): Promise<T> => {
+      if (script === PAGE_SESSION_TOKEN_EXPRESSION) {
+        if (!page) return { status: 401, hasAccessToken: false } as T;
+        const accessToken = jwtFor(page.account ?? "acct_test", new Date(Date.now() + page.minutes * 60_000));
+        return { status: 200, hasAccessToken: true, accessToken } as T;
+      }
+      requests.push(script);
+      return { ok: true, status: 200, body: conversationStream("OK") } as T;
+    });
+    try {
+      await fn(path, () => runChatGptJob(job(), { sessionTokenPath: path, pageEvaluator }), requests);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  test("an expired stored token is replaced by the page's longer-lived token for the same account", async () => {
+    await withExpiringToken(-60, { minutes: 7 * 24 * 60 }, async (path, run, requests) => {
+      expect(await run()).toBe("OK");
+      expect(requests).toHaveLength(1);
+      const saved = JSON.parse(await readFile(path, "utf8"));
+      expect(saved.accountId).toBe("acct_test");
+      expect(Date.parse(saved.expiresAt)).toBeGreaterThan(Date.now() + 6 * 24 * 60 * 60_000);
+    });
+  });
+
+  test("a stored token close to expiry is refreshed, and a fresh one leaves the page alone", async () => {
+    await withExpiringToken(10, { minutes: 7 * 24 * 60 }, async (path, run) => {
+      await run();
+      expect(Date.parse(JSON.parse(await readFile(path, "utf8")).expiresAt)).toBeGreaterThan(Date.now() + 24 * 60 * 60_000);
+    });
+    await withExpiringToken(120, { minutes: 7 * 24 * 60 }, async (path, run) => {
+      const before = await readFile(path, "utf8");
+      await run();
+      expect(await readFile(path, "utf8")).toBe(before);
+    });
+  });
+
+  test("the page's token is not taken for another account, or when the page is logged out", async () => {
+    for (const page of [{ minutes: 7 * 24 * 60, account: "acct_other" }, null]) {
+      await withExpiringToken(-60, page, async (path, run, requests) => {
+        const before = await readFile(path, "utf8");
+        await expect(run()).rejects.toMatchObject({ code: "SESSION_TOKEN_EXPIRED" });
+        expect(requests).toEqual([]);
+        expect(await readFile(path, "utf8")).toBe(before);
+      });
     }
   });
 });
@@ -2291,6 +2367,16 @@ function job(patch: Partial<Pick<JobRecord, "model" | "reasoning">> = {}): JobRe
     updatedAt: now,
   };
 }
+
+function jwtFor(account: string, expiresAt: Date): string {
+  const payload = { exp: Math.floor(expiresAt.getTime() / 1000), "https://api.openai.com/auth": { chatgpt_account_id: account } };
+  return ["header", base64Url(JSON.stringify(payload)), "sig"].join(".");
+}
+
+// For tests that must fail before any page access: reading the live Chrome would be a bug.
+const pageMustNotBeRead = (async () => {
+  throw new Error("The ChatGPT page must not be read here.");
+}) as PageEvaluator;
 
 function fakeJwt(): string {
   const payload = {
