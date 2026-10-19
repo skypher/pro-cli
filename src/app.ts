@@ -167,6 +167,7 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
           const observed = store.latestLimits();
           writeSuccess(io, mode, {
             account,
+            usageLimit: store.usageLimitStatus(),
             observedLimits: observed,
             note:
               observed.length === 0

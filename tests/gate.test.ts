@@ -543,6 +543,26 @@ describe("usage-limit pause", () => {
     expect((await gate("pro-cli job create --json hello")).error).toBe("USAGE_LIMIT_PAUSED");
   });
 
+  test("pro-cli limits says until when requests are paused", async () => {
+    const refusedAt = ago(5);
+    await jobsDb([{ status: "failed", errorCode: "usage_limit", createdAt: ago(6), updatedAt: refusedAt }]);
+    nextRun = { code: 0, stdout: `${JSON.stringify({ ok: true, data: { account: {}, usageLimit: { limited: true } } })}\n`, stderr: "" };
+    const paused = await gate("pro-cli limits --json");
+    expect(paused.code).toBe(0);
+    expect(JSON.parse(paused.stdout).data.usageLimit).toEqual({
+      limited: true,
+      requestsPausedUntil: new Date(Date.parse(refusedAt) + 30 * 60_000).toISOString(),
+    });
+
+    await rm(join(root, "jobs.sqlite"), { force: true });
+    await jobsDb([{ status: "failed", errorCode: "usage_limit", createdAt: ago(32), updatedAt: ago(31) }]);
+    expect(JSON.parse((await gate("pro-cli limits --json")).stdout).data.usageLimit).toEqual({ limited: true, requestsPausedUntil: null });
+
+    nextRun = { code: 0, stdout: '{"ok":true,"data":{"account":{}}}\n', stderr: "" };
+    expect(JSON.parse((await gate("pro-cli limits --json")).stdout)).toEqual({ ok: true, data: { account: {} } });
+    expect(calls).toHaveLength(3);
+  });
+
   test("a missing job database never pauses requests", async () => {
     cfg.jobsDb = join(root, "missing.sqlite");
     expect((await gate("pro-cli job create --json hello")).code).toBe(0);

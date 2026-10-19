@@ -40,6 +40,23 @@ export interface LimitsSnapshot {
   jobId: string | null;
 }
 
+/**
+ * Whether ChatGPT still refuses this account's requests for its usage limit, as the job history
+ * shows it. ChatGPT gives no reset time, so this is only as fresh as the latest refusal or success.
+ */
+export interface UsageLimitStatus {
+  /** The latest usage-limit refusal has no later success on the same model. */
+  limited: boolean;
+  /** The refused model. A limit can cover Pro while cheaper models still work. */
+  model: string | null;
+  /** The first refusal of the latest limit. */
+  since: string | null;
+  /** The latest refusal: the last time the limit was seen in effect. */
+  lastRefusedAt: string | null;
+  /** When a job on the refused model, created after the latest refusal, succeeded. */
+  liftedAt: string | null;
+}
+
 export interface ResearchTaskInput {
   taskId: string;
   title?: string;
@@ -416,6 +433,26 @@ export class JobStore {
       observedAt: row.observed_at,
       jobId: row.job_id,
     }));
+  }
+
+  // Same rules as scripts/pro-cli-limit-watch.ts and the gate's pause: only a success on the
+  // refused model, by a job created after the latest refusal, ends a limit.
+  usageLimitStatus(): UsageLimitStatus {
+    const refused = "status = 'failed' AND json_extract(error_json, '$.details.errorCode') = 'usage_limit'";
+    const latest = this.db
+      .query(`SELECT updated_at AS at, model FROM jobs WHERE ${refused} ORDER BY updated_at DESC LIMIT 1`)
+      .get() as { at: string; model: string } | null;
+    if (!latest) return { limited: false, model: null, since: null, lastRefusedAt: null, liftedAt: null };
+    const lastSuccess = (this.db
+      .query("SELECT MAX(updated_at) AS at FROM jobs WHERE status = 'succeeded' AND model = ? AND updated_at <= ?")
+      .get(latest.model, latest.at) as { at: string | null }).at;
+    const since = (this.db
+      .query(`SELECT MIN(updated_at) AS at FROM jobs WHERE ${refused} AND model = ? AND updated_at > ?`)
+      .get(latest.model, lastSuccess ?? "") as { at: string | null }).at;
+    const liftedAt = (this.db
+      .query("SELECT MIN(updated_at) AS at FROM jobs WHERE status = 'succeeded' AND model = ? AND created_at > ?")
+      .get(latest.model, latest.at) as { at: string | null }).at;
+    return { limited: !liftedAt, model: latest.model, since: since ?? latest.at, lastRefusedAt: latest.at, liftedAt };
   }
 
   upsertResearchTask(jobId: string, task: ResearchTaskInput, leaseUntil: string | null = null): ResearchTaskRecord {

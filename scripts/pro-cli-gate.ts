@@ -545,6 +545,11 @@ async function runProCli(
     const payload = JSON.parse(result.stdout) as { ok: boolean; data: { jobs: Array<{ id: string }> } };
     payload.data.jobs = payload.data.jobs.filter((job) => owned.has(job.id)).slice(0, limit);
     await io.stdout(`${JSON.stringify(payload)}\n`);
+  } else if (args[0] === "limits" && result.code === 0) {
+    // Until requestsPausedUntil, ask, odds and job create fail here with USAGE_LIMIT_PAUSED.
+    const payload = JSON.parse(result.stdout) as { ok: boolean; data: { usageLimit?: Record<string, unknown> } };
+    if (payload.data.usageLimit) payload.data.usageLimit.requestsPausedUntil = usageLimitPause(cfg)?.retryAfter ?? null;
+    await io.stdout(`${JSON.stringify(payload)}\n`);
   } else {
     await io.stdout(result.stdout);
   }
@@ -588,6 +593,9 @@ Deep Research and image generation are not available.
 When ChatGPT refuses a request because the account's usage limit is reached, ask, odds and
 job create fail with USAGE_LIMIT_PAUSED for 30 minutes (until details.retryAfter) without
 reaching ChatGPT.
+pro-cli limits tells whether the usage limit is still in effect, without spending quota:
+data.usageLimit.limited, model, since, lastRefusedAt (the last time a request found it in
+effect), liftedAt, and requestsPausedUntil (null when requests are let through).
 Not available: auth, update, config, setup, doctor, conversations, daemon control,
 --cdp, --port, --conversation, --parent, --save, --store, --no-temporary, --keep-conversation.
 `;

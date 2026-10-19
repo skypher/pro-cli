@@ -645,3 +645,72 @@ describe("job store: concurrent daemons", () => {
     }
   });
 });
+
+describe("job store: usage-limit status", () => {
+  const at = (minutesAgo: number) => new Date(Date.UTC(2026, 9, 19, 12) - minutesAgo * 60_000).toISOString();
+
+  // Jobs created and ended the given minutes ago; a failed one is a usage-limit refusal unless errorCode says otherwise.
+  async function seed(
+    store: JobStore,
+    dir: string,
+    jobs: Array<{ ok: boolean; created: number; ended: number; model?: string; errorCode?: string }>,
+  ) {
+    const { Database } = await import("bun:sqlite");
+    const db = new Database(join(dir, "jobs.sqlite"));
+    try {
+      for (const job of jobs) {
+        const { id } = store.create({ prompt: "question", model: job.model ?? "gpt-6-pro", reasoning: "standard", options: {} });
+        store.markRunning(id);
+        if (job.ok) store.markSucceeded(id, "answer");
+        else store.markFailed(id, new ProError("UPSTREAM_ERROR", "You've hit your limit.", { details: { errorCode: job.errorCode ?? "usage_limit" } }));
+        db.query("UPDATE jobs SET created_at = ?, updated_at = ? WHERE id = ?").run(at(job.created), at(job.ended), id);
+      }
+    } finally {
+      db.close();
+    }
+  }
+
+  test("reports no limit when no request was ever refused for one", async () => {
+    await withStore(async (store, dir) => {
+      expect(store.usageLimitStatus()).toEqual({ limited: false, model: null, since: null, lastRefusedAt: null, liftedAt: null });
+      await seed(store, dir, [{ ok: false, created: 20, ended: 19, errorCode: "something_else" }, { ok: true, created: 10, ended: 5 }]);
+      expect(store.usageLimitStatus().limited).toBe(false);
+      expect(store.usageLimitStatus().lastRefusedAt).toBeNull();
+    });
+  });
+
+  test("a limit runs from the first refusal after the last success to the latest refusal", async () => {
+    await withStore(async (store, dir) => {
+      await seed(store, dir, [
+        { ok: false, created: 300, ended: 299 },
+        { ok: true, created: 250, ended: 200 },
+        { ok: false, created: 121, ended: 120 },
+        { ok: false, created: 61, ended: 60 },
+        { ok: true, created: 50, ended: 40, model: "gpt-6" },
+      ]);
+      expect(store.usageLimitStatus()).toEqual({ limited: true, model: "gpt-6-pro", since: at(120), lastRefusedAt: at(60), liftedAt: null });
+    });
+  });
+
+  test("a later success on the refused model lifts the limit", async () => {
+    await withStore(async (store, dir) => {
+      await seed(store, dir, [
+        { ok: false, created: 121, ended: 120 },
+        { ok: false, created: 61, ended: 60 },
+        { ok: true, created: 59, ended: 30 },
+        { ok: true, created: 20, ended: 10 },
+      ]);
+      expect(store.usageLimitStatus()).toEqual({ limited: false, model: "gpt-6-pro", since: at(120), lastRefusedAt: at(60), liftedAt: at(30) });
+    });
+  });
+
+  test("a success that started before the latest refusal does not lift it", async () => {
+    await withStore(async (store, dir) => {
+      await seed(store, dir, [
+        { ok: false, created: 61, ended: 60 },
+        { ok: true, created: 90, ended: 10 },
+      ]);
+      expect(store.usageLimitStatus().limited).toBe(true);
+    });
+  });
+});
