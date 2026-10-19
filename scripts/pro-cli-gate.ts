@@ -730,6 +730,8 @@ if (import.meta.main) {
     maxInboxFiles: 200,
     jobsDb: join(home, ".pro-cli", "jobs.sqlite"),
   };
+  // process.exit drops output still queued for a pipe, so stderr goes out through Bun.write too.
+  let stderrWritten: Promise<unknown> = Promise.resolve();
   const code = await runGate(
     cfg,
     process.env.SSH_ORIGINAL_COMMAND,
@@ -738,10 +740,13 @@ if (import.meta.main) {
       stdout: async (chunk) => {
         await Bun.write(Bun.stdout, chunk);
       },
-      stderr: (chunk) => process.stderr.write(chunk),
+      stderr: (chunk) => {
+        stderrWritten = stderrWritten.then(() => Bun.write(Bun.stderr, chunk)).catch(() => undefined);
+      },
       clientGone: watchClient(),
     },
     spawnProCli,
   );
+  await stderrWritten;
   process.exit(code);
 }
