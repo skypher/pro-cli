@@ -1134,6 +1134,68 @@ describe("ChatGPT transport", () => {
     });
   });
 
+  test("logs the shape of citation markers and their references, without titles, URLs or answer text", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const diagnosticsDir = await mkdtemp(join(tmpdir(), "pro-citations-"));
+      try {
+        const marker = "\ue200cite\ue202turn0search3\ue202turn0view1\ue201";
+        const genui = '\ue200genui\ue202{"citation":{"refs":["turn0view1"]}}\ue201';
+        const reference = {
+          matched_text: marker,
+          start_idx: 12,
+          end_idx: 40,
+          type: "grouped_webpages",
+          alt: "([secret-site.example](https://secret-site.example/page))",
+          items: [{ title: "Secret Title", url: "https://secret-site.example/page", attribution: "secret-site.example" }],
+        };
+        const body = [
+          'data: {"v":{"message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":[""]},"status":"in_progress"},"conversation_id":"conv_cite"}}',
+          `data: ${JSON.stringify({ o: "patch", v: [
+            { p: "/message/content/parts/0", o: "append", v: `Secret answer ${marker} and ${genui}.` },
+            { p: "/message/metadata/content_references", o: "append", v: [reference] },
+          ] })}`,
+          'data: {"type":"message_stream_complete"}',
+          "",
+        ].join("\n\n");
+        const pageEvaluator = (async <T>(): Promise<T> => ({ ok: true, status: 200, body }) as T);
+
+        await runChatGptJob(job(), { sessionTokenPath, pageEvaluator, diagnosticsDir });
+
+        const raw = await readFile(join(diagnosticsDir, "citations.jsonl"), "utf8");
+        expect(JSON.parse(raw)).toMatchObject({
+          jobId: "job_test",
+          conversationId: "conv_cite",
+          markers: [["cite", "turn0search3", "turn0view1"], ["genui", '{"citation":{"refs":["turn0view1"]}}']],
+          references: [{
+            type: "grouped_webpages",
+            keys: ["alt", "end_idx", "items", "matched_text", "start_idx", "type"],
+            matchedText: ["cite", "turn0search3", "turn0view1"],
+            itemCount: 1,
+            itemKeys: ["attribution", "title", "url"],
+          }],
+          patchPaths: ["append /message/metadata/content_references"],
+        });
+        expect(raw).not.toContain("secret");
+        expect(raw).not.toContain("Secret");
+      } finally {
+        await rm(diagnosticsDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  test("writes no citation log for an answer without citations", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const diagnosticsDir = await mkdtemp(join(tmpdir(), "pro-citations-"));
+      try {
+        const pageEvaluator = (async <T>(): Promise<T> => ({ ok: true, status: 200, body: conversationStream("OK") }) as T);
+        expect(await runChatGptJob(job(), { sessionTokenPath, pageEvaluator, diagnosticsDir })).toBe("OK");
+        expect(await readFile(join(diagnosticsDir, "citations.jsonl"), "utf8").catch(() => null)).toBeNull();
+      } finally {
+        await rm(diagnosticsDir, { recursive: true, force: true });
+      }
+    });
+  });
+
   test("continues appending across typed events between delta frames", async () => {
     await withTokenFile(async (sessionTokenPath) => {
       const pageEvaluator = (async <T>(): Promise<T> =>
