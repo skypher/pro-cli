@@ -52,8 +52,6 @@ const MODEL_ID_ALIASES: Record<string, string> = {
   "5.6-thinking": "gpt-5-6-thinking",
   "gpt-5.6-thinking": "gpt-5-6-thinking",
   "gpt 5.6 thinking": "gpt-5-6-thinking",
-  "sol": "gpt-5.6-sol-wm",
-  "gpt-5.6-sol": "gpt-5.6-sol-wm",
   "terra": "gpt-5.6-terra-wm",
   "gpt-5.6-terra": "gpt-5.6-terra-wm",
   "luna": "gpt-5.6-luna-wm",

@@ -689,7 +689,7 @@ describe("robot-mode CLI", () => {
       for (const [command, model] of [
         [["job", "create"], "gpt-5-6-thinking"],
         [["job", "create"], "gpt-6"],
-        [["job", "create"], "sol"],
+        [["job", "create"], "terra"],
         [["job", "create"], "gpt-4.5"],
         [["ask"], "gpt-5-5-thinking"],
         [["odds"], "luna"],

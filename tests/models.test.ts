@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, test } from "bun:test";
-import { listModels } from "../src/models";
+import { canonicalModelId, listModels } from "../src/models";
 
 const originalFetch = globalThis.fetch;
 
@@ -30,6 +30,14 @@ async function withTokenFile<T>(fn: (path: string) => Promise<T>): Promise<T> {
     await rm(dir, { recursive: true, force: true });
   }
 }
+
+describe("model aliases", () => {
+  test("GPT-5.6 Sol has no alias", () => {
+    expect(canonicalModelId("sol")).toBe("sol");
+    expect(canonicalModelId("gpt-5.6-sol")).toBe("gpt-5.6-sol");
+    expect(canonicalModelId("terra")).toBe("gpt-5.6-terra-wm");
+  });
+});
 
 describe("model discovery", () => {
   test("falls back to static models when no session token is available", async () => {
