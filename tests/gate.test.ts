@@ -549,3 +549,92 @@ describe("usage-limit pause", () => {
     expect(calls).toHaveLength(1);
   });
 });
+
+describe("client gone", () => {
+  const audit = async () =>
+    (await readFile(join(cfg.stateRoot, cfg.key, "audit.log"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+
+  // Runs the gate with a client that hangs up: its writes fail like a closed SSH channel's.
+  async function gateAfterHangUp(line: string, runner: Parameters<typeof runGate>[3], gone = new AbortController()) {
+    let stderr = "";
+    const code = await runGate(
+      cfg,
+      line,
+      {
+        stdin: (async function* () {})(),
+        stdout: () => {
+          throw Object.assign(new Error("EPIPE: broken pipe, write"), { code: "EPIPE" });
+        },
+        stderr: (chunk) => {
+          stderr += chunk;
+        },
+        clientGone: gone.signal,
+      },
+      runner,
+    );
+    return { code, stderr };
+  }
+
+  test("a write to a client that hung up is recorded as CLIENT_GONE, not an internal error", async () => {
+    const result = await gateAfterHangUp("pro-cli daemon status --json", async () => nextRun);
+    expect(result.code).toBe(7);
+    expect(result.stderr).toBe("");
+    expect(await audit()).toMatchObject([{ verb: "pro-cli daemon status", code: 7, error: "CLIENT_GONE" }]);
+  });
+
+  test("an orphaned job wait is stopped once the client is gone", async () => {
+    await seedOwned(JOB_A);
+    const gone = new AbortController();
+    let signalled: AbortSignal | undefined;
+    const result = await gateAfterHangUp(
+      `pro-cli job wait ${JOB_A} --json`,
+      async (_argv, _cwd, _env, signal) => {
+        signalled = signal;
+        setTimeout(() => gone.abort(), 5);
+        await new Promise((resolve) => signal?.addEventListener("abort", resolve, { once: true }));
+        return { code: 143, stdout: "", stderr: "" };
+      },
+      gone,
+    );
+    expect(signalled).toBe(gone.signal);
+    expect(result.code).toBe(7);
+    expect(await audit()).toMatchObject([{ verb: "pro-cli job wait", error: "CLIENT_GONE" }]);
+  });
+
+  test("a request runs on without the client, so its job is still recorded as this key's", async () => {
+    const gone = new AbortController();
+    gone.abort();
+    let signalled: AbortSignal | undefined = gone.signal;
+    const result = await gateAfterHangUp(
+      "pro-cli job create --wait --json hello",
+      async (_argv, _cwd, _env, signal) => {
+        signalled = signal;
+        return { code: 0, stdout: `{"ok":true,"data":{"job":{"id":"${JOB_B}"}}}\n`, stderr: "" };
+      },
+      gone,
+    );
+    expect(signalled).toBeUndefined();
+    expect(result.code).toBe(7);
+    expect(await readFile(join(cfg.stateRoot, cfg.key, "jobs"), "utf8")).toBe(`${JOB_B}\n`);
+    expect(await audit()).toMatchObject([{ verb: "pro-cli job create", error: "CLIENT_GONE" }]);
+  });
+
+  test("another internal error keeps GATE_INTERNAL and records only its system error code", async () => {
+    const code = await runGate(
+      cfg,
+      "pro-cli daemon status --json",
+      {
+        stdin: (async function* () {})(),
+        stdout: () => {
+          throw Object.assign(new Error("ENOSPC: no space left on device, write"), { code: "ENOSPC" });
+        },
+        stderr: () => undefined,
+      },
+      async () => nextRun,
+    );
+    expect(code).toBe(7);
+    const [entry] = await audit();
+    expect(entry).toMatchObject({ error: "GATE_INTERNAL", errno: "ENOSPC" });
+    expect(JSON.stringify(entry)).not.toContain("no space");
+  });
+});

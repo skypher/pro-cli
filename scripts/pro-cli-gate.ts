@@ -40,6 +40,8 @@ export interface GateIO {
   stdin: AsyncIterable<Uint8Array>;
   stdout: (chunk: Uint8Array | string) => void | Promise<void>;
   stderr: (chunk: string) => void;
+  /** Aborted once the SSH client is gone, so nothing written reaches anyone. */
+  clientGone?: AbortSignal;
 }
 
 export interface ProCliRun {
@@ -48,7 +50,8 @@ export interface ProCliRun {
   stderr: string;
 }
 
-export type ProCliRunner = (argv: string[], cwd: string, env: Record<string, string>) => Promise<ProCliRun>;
+/** signal, when given, stops pro-cli early. */
+export type ProCliRunner = (argv: string[], cwd: string, env: Record<string, string>, signal?: AbortSignal) => Promise<ProCliRun>;
 
 export class GateError extends Error {
   constructor(
@@ -527,10 +530,14 @@ async function runProCli(
       );
     }
   }
-  const result = await runner([...cfg.proCli, ...checked.argv], inboxDir(cfg), cfg.env);
+  // Clients drop long `job wait` calls; a wait only reads, so an orphaned one stops. Requests run
+  // on without the client, so their jobs are still recorded as this key's and --github chats deleted.
+  const stoppable = args[0] === "job" && args[1] === "wait";
+  const result = await runner([...cfg.proCli, ...checked.argv], inboxDir(cfg), cfg.env, stoppable ? io.clientGone : undefined);
   if (kind === "ask" || kind === "odds" || kind === "job create") {
     await recordJobs(cfg, [...createdJobIds(result.stdout), ...createdJobIds(result.stderr)]);
   }
+  if (io.clientGone?.aborted) throw clientGoneError();
   if (kind === "job list" && result.code === 0) {
     const owned = await ownedJobs(cfg);
     const limitArg = args.find((arg, i) => args[i - 1] === "--limit") ?? args.find((arg) => arg.startsWith("--limit="))?.slice(8);
@@ -589,6 +596,7 @@ export async function runGate(cfg: GateConfig, commandLine: string | undefined, 
   let verb = "invalid";
   let code = 2;
   let errorCode: string | undefined;
+  let internalErrno: string | undefined;
   let github = false;
   try {
     if (!KEY_NAME.test(cfg.key)) throw new GateError("GATE_MISCONFIGURED", "Invalid gate key name.", 7);
@@ -631,15 +639,25 @@ export async function runGate(cfg: GateConfig, commandLine: string | undefined, 
         throw new GateError("COMMAND_DENIED", `Unknown command ${JSON.stringify(verb)}.\n${HELP}`);
     }
   } catch (error) {
-    const gateError = error instanceof GateError ? error : new GateError("GATE_INTERNAL", String((error as Error)?.message ?? error), 7);
-    io.stderr(
-      `${JSON.stringify({
-        ok: false,
-        error: { code: gateError.code, message: gateError.message, ...(gateError.details ? { details: gateError.details } : {}) },
-      })}\n`,
-    );
+    // A write fails with EPIPE once the client has hung up.
+    const errno = (error as NodeJS.ErrnoException)?.code;
+    const gateError = error instanceof GateError
+      ? error
+      : errno === "EPIPE" || io.clientGone?.aborted
+        ? clientGoneError()
+        : new GateError("GATE_INTERNAL", String((error as Error)?.message ?? error), 7);
+    if (gateError.code !== "CLIENT_GONE") {
+      io.stderr(
+        `${JSON.stringify({
+          ok: false,
+          error: { code: gateError.code, message: gateError.message, ...(gateError.details ? { details: gateError.details } : {}) },
+        })}\n`,
+      );
+    }
     code = gateError.exitCode;
     errorCode = gateError.code;
+    // The system error code (e.g. ENOSPC) says what broke; the message may quote request text.
+    if (errorCode === "GATE_INTERNAL" && typeof errno === "string" && /^E[A-Z0-9]{1,15}$/.test(errno)) internalErrno = errno;
   }
   await appendFile(
     join(stateDir(cfg), "audit.log"),
@@ -648,6 +666,7 @@ export async function runGate(cfg: GateConfig, commandLine: string | undefined, 
       verb: verb.slice(0, 64),
       code,
       ...(errorCode ? { error: errorCode } : {}),
+      ...(internalErrno ? { errno: internalErrno } : {}),
       ...(github ? { github: true } : {}),
     })}\n`,
     { mode: 0o600 },
@@ -655,13 +674,41 @@ export async function runGate(cfg: GateConfig, commandLine: string | undefined, 
   return code;
 }
 
-async function spawnProCli(argv: string[], cwd: string, env: Record<string, string>): Promise<ProCliRun> {
+function clientGoneError(): GateError {
+  return new GateError("CLIENT_GONE", "The SSH client went away before the output could be written.", 7);
+}
+
+async function spawnProCli(argv: string[], cwd: string, env: Record<string, string>, signal?: AbortSignal): Promise<ProCliRun> {
   const child = Bun.spawn(argv, { cwd, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
-  const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
-  return { code, stdout, stderr };
+  const stop = () => child.kill();
+  if (signal?.aborted) stop();
+  signal?.addEventListener("abort", stop, { once: true });
+  try {
+    const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    return { code, stdout, stderr };
+  } finally {
+    signal?.removeEventListener("abort", stop);
+  }
+}
+
+// sshd's session process is the gate's parent and exits when the client disconnects, so a changed
+// parent means the client is gone.
+function watchClient(everyMs = 2_000): AbortSignal {
+  const parent = process.ppid;
+  const gone = new AbortController();
+  const timer = setInterval(() => {
+    if (process.ppid === parent) return;
+    gone.abort();
+    clearInterval(timer);
+  }, everyMs);
+  timer.unref();
+  return gone.signal;
 }
 
 if (import.meta.main) {
+  // Writes to a hung-up client fail; runGate records that, so the pipes' error events are not fatal.
+  process.stdout.on("error", () => undefined);
+  process.stderr.on("error", () => undefined);
   const home = homedir();
   const bun = join(home, ".bun", "bin", "bun");
   const cfg: GateConfig = {
@@ -684,6 +731,7 @@ if (import.meta.main) {
         await Bun.write(Bun.stdout, chunk);
       },
       stderr: (chunk) => process.stderr.write(chunk),
+      clientGone: watchClient(),
     },
     spawnProCli,
   );
