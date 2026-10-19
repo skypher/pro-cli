@@ -1,0 +1,9 @@
+[Unit]
+Description=Run the pro-cli health check twice a day
+
+[Timer]
+OnCalendar=*-*-* 09,21:23:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

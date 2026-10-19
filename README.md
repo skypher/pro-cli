@@ -290,6 +290,25 @@ The config fields:
 
 The watch logs one line per event to `~/.local/state/pro-cli-limit-watch/watch.log` and never reads prompt or answer text. After a refusal, the SSH gate also refuses new requests for 30 minutes (`USAGE_LIMIT_PAUSED`).
 
+### Health check
+
+`scripts/pro-cli-health-check.ts` runs twice a day and sends a notice through the limit watch's channels (same config file) only when there is a new problem:
+- **Browser:** Chrome's CDP port does not answer, or the ChatGPT page is logged out or cannot be read.
+- **Session token:** the stored token is missing, expired, or expires within 48 hours while the page holds no longer-lived token for the same account. Jobs refresh the stored token from the page by themselves, but only when the page has a newer one.
+- **Failures since the last run:** gate calls that broke inside the gate or for a login, Chrome, token or daemon reason; failed jobs other than usage-limit refusals; answers recovered from kept chats, which a gate key should fetch again.
+- **Timers:** the usage-limit watch timer is not active.
+
+A lasting problem is announced once, and again only after it cleared. The first run only sets the starting point for failures. Setup:
+
+```sh
+mkdir -p ~/.local/state/pro-cli-health-check
+cp scripts/systemd/pro-cli-health-check.{service,timer} ~/.config/systemd/user/   # adjust the bun and checkout paths
+systemctl --user daemon-reload && systemctl --user enable --now pro-cli-health-check.timer
+bun scripts/pro-cli-health-check.ts --dry-run   # shows what it would send, without sending or saving anything
+```
+
+Each run logs one line to `~/.local/state/pro-cli-health-check/check.log`. It never reads prompt or answer text.
+
 ## Conversations
 
 New `ask` and `job create` requests default to temporary ChatGPT conversations. Use `--save` when the turn should be written to ChatGPT history.

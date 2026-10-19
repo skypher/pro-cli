@@ -1,0 +1,11 @@
+# Copy to ~/.config/systemd/user/ together with the .timer; adjust the bun and checkout paths,
+# and create ~/.local/state/pro-cli-health-check/ first.
+[Unit]
+Description=pro-cli health check
+
+[Service]
+Type=oneshot
+ExecStart=%h/.bun/bin/bun %h/pro-cli/scripts/pro-cli-health-check.ts
+StandardOutput=append:%h/.local/state/pro-cli-health-check/check.log
+StandardError=append:%h/.local/state/pro-cli-health-check/check.log
+TimeoutStartSec=300
