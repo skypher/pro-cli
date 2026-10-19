@@ -75,17 +75,7 @@ pro-cli doctor --json
 
 This is the normal long-running path. It creates `~/.pro-cli/chrome-profile`, keeps ChatGPT auth separate from your personal Chrome profile, and limits what the open debugging port can see.
 
-Port `9222` is the default. If you use another port, pass the same `--cdp` or `--port` to `doctor`, `ask`, and `job create`, or store it once with `pro-cli config set cdp-port <port>`. `job wait` uses the CDP value stored on the job.
-
-To use two ChatGPT accounts at once, give each its own pro-cli home and Chrome. Each home keeps its own profile, job database and daemon:
-
-```sh
-export PRO_CLI_HOME=~/.pro-cli-2
-pro-cli config set cdp-port 9223 --json
-pro-cli auth command --json   # prints the Chrome command for ~/.pro-cli-2/chrome-profile on port 9223
-```
-
-Start Chrome with that command, sign in to the second account in its window, then run `pro-cli auth capture --json` with the same `PRO_CLI_HOME`. Commands under that home use port 9223 without a `--port` flag.
+Port `9222` is the default. If you use another port, pass the same `--cdp` or `--port` to `doctor`, `ask`, and `job create`. `job wait` uses the CDP value stored on the job.
 
 ## Runtime Model
 

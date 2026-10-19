@@ -345,39 +345,6 @@ describe("robot-mode CLI", () => {
     });
   });
 
-  test("config set cdp-port makes the home's commands use that port unless --port or --cdp is given", async () => {
-    await withHome(async (home) => {
-      const set = await run(["config", "set", "cdp-port", "9223", "--json"], { tty: true, home });
-      expect(set.code).toBe(0);
-      expect(JSON.parse(set.stdout).data.config.cdpPort).toBe(9223);
-      for (const bad of ["0", "65536", "port"]) {
-        const rejected = await run(["config", "set", "cdp-port", bad, "--json"], { tty: true, home });
-        expect(rejected.code).not.toBe(0);
-      }
-
-      const command = JSON.parse((await run(["auth", "command", "--json"], { tty: true, home })).stdout).data;
-      expect(command.command).toContain("--remote-debugging-port=9223");
-      expect(command.command).toContain(join(home, "chrome-profile"));
-
-      const created = await run(["job", "create", "hello", "--no-start", "--json"], { tty: true, home });
-      expect(JSON.parse(created.stdout).data.job.options.cdpBase).toBe("http://127.0.0.1:9223");
-      const byPort = await run(["job", "create", "hello", "--no-start", "--port", "9333", "--json"], { tty: true, home });
-      expect(JSON.parse(byPort.stdout).data.job.options.cdpBase).toBe("http://127.0.0.1:9333");
-      const byCdp = await run(["job", "create", "hello", "--no-start", "--cdp", "http://127.0.0.1:9444", "--json"], {
-        tty: true,
-        home,
-      });
-      expect(JSON.parse(byCdp.stdout).data.job.options.cdpBase).toBe("http://127.0.0.1:9444");
-    });
-  });
-
-  test("job create without a configured CDP port leaves the job on the default Chrome", async () => {
-    await withHome(async (home) => {
-      const created = await run(["job", "create", "hello", "--no-start", "--json"], { tty: true, home });
-      expect(JSON.parse(created.stdout).data.job.options.cdpBase).toBeUndefined();
-    });
-  });
-
   test("ask executes without durable job storage and returns the full result", async () => {
     await withHome(async (home) => {
       await mkdir(join(home, "tokens"), { recursive: true });
