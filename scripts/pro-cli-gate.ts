@@ -69,6 +69,7 @@ export class GateError extends Error {
 // each reaching ChatGPT; the first one after the pause shows whether the limit is over.
 const USAGE_LIMIT_PAUSE_MS = 30 * 60_000;
 
+const UTF8 = new TextDecoder("utf-8", { fatal: true });
 const KEY_NAME = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const FILE_NAME = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/;
 const ERROR_CODE = /^[A-Z][A-Z0-9_]{0,63}$/;
@@ -175,21 +176,41 @@ export function splitCommand(line: string): string[] {
   const fail = (message: string): never => {
     throw new GateError("BAD_COMMAND_LINE", message);
   };
+  // \x and octal escapes in $'...' are bytes. printf %q outside a UTF-8 locale writes ü as
+  // $'\303\274' (bash) or $'\303'$'\274' (zsh), so a run of them is decoded as UTF-8 together.
+  let bytes: number[] = [];
+  const flushBytes = () => {
+    if (bytes.length === 0) return;
+    try {
+      word += UTF8.decode(new Uint8Array(bytes));
+    } catch {
+      fail("Escaped bytes in $'...' quotes are not valid UTF-8.");
+    }
+    bytes = [];
+  };
+  const add = (text: string) => {
+    flushBytes();
+    word += text;
+  };
+  const endWord = () => {
+    flushBytes();
+    if (inWord) words.push(word);
+    word = "";
+    inWord = false;
+  };
 
   while (index < line.length) {
     const char = line[index];
     if (/[\x00-\x08\x0b-\x1f\x7f]/.test(char)) fail("Control characters are not allowed.");
     if (char === " " || char === "\t" || char === "\n") {
-      if (inWord) words.push(word);
-      word = "";
-      inWord = false;
+      endWord();
       index += 1;
       continue;
     }
     if (char === "'") {
       const end = line.indexOf("'", index + 1);
       if (end < 0) fail("Unterminated single quote.");
-      word += line.slice(index + 1, end);
+      add(line.slice(index + 1, end));
       inWord = true;
       index = end + 1;
       continue;
@@ -201,7 +222,7 @@ export function splitCommand(line: string): string[] {
         const c = line[index];
         if (c === "'") break;
         if (c !== "\\") {
-          word += c;
+          add(c);
           index += 1;
           continue;
         }
@@ -211,15 +232,15 @@ export function splitCommand(line: string): string[] {
           "\\": "\\", "'": "'", '"': '"', "?": "?",
         };
         if (e !== undefined && e in simple) {
-          word += simple[e];
+          add(simple[e]);
           index += 2;
         } else if (e === "x" && /^[0-9a-fA-F]{1,2}/.test(line.slice(index + 2))) {
           const hex = line.slice(index + 2).match(/^[0-9a-fA-F]{1,2}/)![0];
-          word += String.fromCharCode(Number.parseInt(hex, 16));
+          bytes.push(Number.parseInt(hex, 16));
           index += 2 + hex.length;
         } else if (e !== undefined && /[0-7]/.test(e)) {
           const oct = line.slice(index + 1).match(/^[0-7]{1,3}/)![0];
-          word += String.fromCharCode(Number.parseInt(oct, 8));
+          bytes.push(Number.parseInt(oct, 8) & 0xff);
           index += 1 + oct.length;
         } else {
           fail(`Unsupported escape \\${e ?? ""} in $'...' quote.`);
@@ -237,11 +258,11 @@ export function splitCommand(line: string): string[] {
         if (c === '"') break;
         if (c === "$" || c === "`") fail("Expansion inside double quotes is not allowed.");
         if (c === "\\" && index + 1 < line.length && '$`"\\\n'.includes(line[index + 1])) {
-          if (line[index + 1] !== "\n") word += line[index + 1];
+          if (line[index + 1] !== "\n") add(line[index + 1]);
           index += 2;
           continue;
         }
-        word += c;
+        add(c);
         index += 1;
       }
       inWord = true;
@@ -250,18 +271,18 @@ export function splitCommand(line: string): string[] {
     }
     if (char === "\\") {
       if (index + 1 >= line.length) fail("Trailing backslash.");
-      if (line[index + 1] !== "\n") word += line[index + 1];
+      if (line[index + 1] !== "\n") add(line[index + 1]);
       inWord = true;
       index += 2;
       continue;
     }
     if (";&|<>()$`*?[]{}".includes(char)) fail(`Unquoted shell metacharacter ${JSON.stringify(char)} is not allowed.`);
     if (!inWord && (char === "#" || char === "~")) fail(`Unquoted ${JSON.stringify(char)} at word start is not allowed.`);
-    word += char;
+    add(char);
     inWord = true;
     index += 1;
   }
-  if (inWord) words.push(word);
+  endWord();
   return words;
 }
 

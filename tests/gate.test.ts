@@ -79,14 +79,25 @@ async function seedOwned(...ids: string[]) {
 }
 
 describe("splitCommand", () => {
-  test("round-trips bash and zsh printf %q quoting", () => {
-    const samples = ["plain", "two words", "it's", 'say "hi"', "a\nb", "tab\there", "dollar $HOME", "semi;colon", "*glob?", "ünïcode ✓", "back\\slash", "@file.md", "--cdp=x"];
+  test("round-trips bash and zsh printf %q quoting in UTF-8 and C locales", () => {
+    const samples = ["plain", "two words", "it's", 'say "hi"', "a\nb", "tab\there", "dollar $HOME", "semi;colon", "*glob?", "ünïcode ✓", "emoji 😀", "a\nb😀", "back\\slash", "@file.md", "--cdp=x"];
     // bash is required; zsh is checked too where it is installed, since clients may wrap with either.
     const shells = ["bash", ...(Bun.which("zsh") ? ["zsh"] : [])];
     for (const shell of shells) {
-      const quoted = spawnSync(shell, ["-c", 'printf "%q " "$@"', "_", ...samples], { encoding: "utf8" });
-      expect(quoted.status).toBe(0);
-      expect(splitCommand(quoted.stdout)).toEqual(samples);
+      for (const locale of ["C.UTF-8", "C"]) {
+        const quoted = spawnSync(shell, ["-c", 'printf "%q " "$@"', "_", ...samples], { encoding: "utf8", env: { ...process.env, LC_ALL: locale } });
+        expect(quoted.status).toBe(0);
+        // Outside a UTF-8 locale both shells write non-ASCII text as octal byte escapes.
+        if (locale === "C") expect(quoted.stdout).toContain("\\303");
+        expect(splitCommand(quoted.stdout)).toEqual(samples);
+      }
+    }
+  });
+
+  test("decodes escaped bytes as UTF-8 and rejects bytes that are not", () => {
+    expect(splitCommand("ask $'\\x41\\102' $'\\303'$'\\274'ber")).toEqual(["ask", "AB", "über"]);
+    for (const line of ["ask $'\\303'", "ask $'\\303'x", "ask $'\\xff'"]) {
+      expect(() => splitCommand(line)).toThrow("not valid UTF-8");
     }
   });
 
