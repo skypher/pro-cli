@@ -1185,52 +1185,87 @@ describe("ChatGPT transport", () => {
     });
   });
 
-  test("logs the shape of citation markers and their references, without titles, URLs or answer text", async () => {
-    await withTokenFile(async (sessionTokenPath) => {
-      const diagnosticsDir = await mkdtemp(join(tmpdir(), "pro-citations-"));
-      try {
-        const marker = "\ue200cite\ue202turn0search3\ue202turn0view1\ue201";
-        const genui = '\ue200genui\ue202{"citation":{"refs":["turn0view1"]}}\ue201';
-        const reference = {
-          matched_text: marker,
-          start_idx: 12,
-          end_idx: 40,
+  describe("citations", () => {
+    const cite = "\ue200cite\ue202turn0search0\ue202turn0search1\ue201";
+    const genui = '\ue200genui\ue202{"citation":{"ref":"turn1view0"}}\ue201';
+    const answer = [
+      `Bun 1.4.3 is out. ${cite}`,
+      'It checks types. <Cite refs={["turn0view0"]}/>',
+      `Also fast. ${genui}`,
+      'Notes: <Link url="https://bun.com/blog/bun-v1.4.3?utm_source=chatgpt.com" title="Release notes"/>',
+      "Unknown: \ue200cite\ue202turn9search9\ue201 end.",
+    ].join("\n");
+    const searchResult = (turn: number, type: string, index: number, url: string, title: string) =>
+      ({ type: "search_result", url, title, ref_id: { turn_index: turn, ref_type: type, ref_index: index } });
+    const body = [
+      'event: delta_encoding\ndata: "v1"',
+      'event: delta\ndata: {"p":"","o":"add","v":{"message":{"id":"a","author":{"role":"assistant"},"channel":"final","recipient":"all","content":{"content_type":"text","parts":[""]},"status":"in_progress"},"conversation_id":"conv_cite"},"c":5}',
+      `event: delta\ndata: ${JSON.stringify({ o: "patch", v: [{ p: "/message/content/parts/0", o: "append", v: answer }] })}`,
+      `event: delta\ndata: ${JSON.stringify({ v: [
+        { p: "/message/status", o: "replace", v: "finished_successfully" },
+        { p: "/message/end_turn", o: "replace", v: true },
+        { p: "/message/metadata/content_references", o: "append", v: [{
+          matched_text: genui,
           type: "grouped_webpages",
-          alt: "([secret-site.example](https://secret-site.example/page))",
-          items: [{ title: "Secret Title", url: "https://secret-site.example/page", attribution: "secret-site.example" }],
-        };
-        const body = [
-          'data: {"v":{"message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":[""]},"status":"in_progress"},"conversation_id":"conv_cite"}}',
-          `data: ${JSON.stringify({ o: "patch", v: [
-            { p: "/message/content/parts/0", o: "append", v: `Secret answer ${marker} and ${genui}.` },
-            { p: "/message/metadata/content_references", o: "append", v: [reference] },
-          ] })}`,
-          'data: {"type":"message_stream_complete"}',
-          "",
-        ].join("\n\n");
+          items: [{ title: "Bun v1.4.3 | Bun Blog", url: "https://bun.com/blog/bun-v1.4.3", refs: [{ turn_index: 1, ref_type: "view", ref_index: 0 }] }],
+        }] },
+        { p: "/message/metadata", o: "append", v: { search_result_groups: [{ type: "search_result_group", entries: [
+          searchResult(0, "search", 0, "https://github.com/oven-sh/bun/releases?utm_source=chatgpt.com", "Releases"),
+          searchResult(0, "search", 1, "https://bun.com/blog", "Blog"),
+          searchResult(0, "view", 0, "https://bun.com/blog/bun-v1.4.3", "Bun v1.4.3"),
+        ] }] } },
+      ] })}`,
+      'data: {"type":"message_stream_complete","conversation_id":"conv_cite"}',
+      "data: [DONE]",
+      "",
+    ].join("\n\n");
+    const citing = (citations?: string): JobRecord => ({ ...job(), options: { ...job().options, ...(citations ? { citations } : {}) } });
+
+    test("numbered: become [n] references and a Sources list; counts only are logged", async () => {
+      await withTokenFile(async (sessionTokenPath) => {
+        const diagnosticsDir = await mkdtemp(join(tmpdir(), "pro-citations-"));
+        try {
+          const pageEvaluator = (async <T>(): Promise<T> => ({ ok: true, status: 200, body }) as T);
+
+          const result = await runChatGptJob(citing("numbered"), { sessionTokenPath, pageEvaluator, diagnosticsDir });
+
+          expect(result).toBe([
+            "Bun 1.4.3 is out. [1][2]",
+            "It checks types. [3]",
+            "Also fast. [3]",
+            "Notes: [Release notes](https://bun.com/blog/bun-v1.4.3)",
+            "Unknown: end.",
+            "",
+            "Sources:",
+            "[1] Releases — https://github.com/oven-sh/bun/releases",
+            "[2] Blog — https://bun.com/blog",
+            "[3] Bun v1.4.3 — https://bun.com/blog/bun-v1.4.3",
+            "",
+          ].join("\n"));
+          const log = await readFile(join(diagnosticsDir, "citations.jsonl"), "utf8");
+          expect(JSON.parse(log)).toMatchObject({ jobId: "job_test", mode: "numbered", citations: 4, resolved: 3, links: 1, sources: 3, otherKinds: [] });
+          expect(log).not.toContain("bun.com");
+          expect(log).not.toContain("Releases");
+        } finally {
+          await rm(diagnosticsDir, { recursive: true, force: true });
+        }
+      });
+    });
+
+    test("strip: are removed and links kept; raw and an unset option leave the text alone", async () => {
+      await withTokenFile(async (sessionTokenPath) => {
         const pageEvaluator = (async <T>(): Promise<T> => ({ ok: true, status: 200, body }) as T);
 
-        await runChatGptJob(job(), { sessionTokenPath, pageEvaluator, diagnosticsDir });
-
-        const raw = await readFile(join(diagnosticsDir, "citations.jsonl"), "utf8");
-        expect(JSON.parse(raw)).toMatchObject({
-          jobId: "job_test",
-          conversationId: "conv_cite",
-          markers: [["cite", "turn0search3", "turn0view1"], ["genui", '{"citation":{"refs":["turn0view1"]}}']],
-          references: [{
-            type: "grouped_webpages",
-            keys: ["alt", "end_idx", "items", "matched_text", "start_idx", "type"],
-            matchedText: ["cite", "turn0search3", "turn0view1"],
-            itemCount: 1,
-            itemKeys: ["attribution", "title", "url"],
-          }],
-          patchPaths: ["append /message/metadata/content_references"],
-        });
-        expect(raw).not.toContain("secret");
-        expect(raw).not.toContain("Secret");
-      } finally {
-        await rm(diagnosticsDir, { recursive: true, force: true });
-      }
+        expect(await runChatGptJob(citing("strip"), { sessionTokenPath, pageEvaluator })).toBe([
+          "Bun 1.4.3 is out.",
+          "It checks types.",
+          "Also fast.",
+          "Notes: [Release notes](https://bun.com/blog/bun-v1.4.3)",
+          "Unknown: end.",
+        ].join("\n"));
+        expect(await runChatGptJob(citing("raw"), { sessionTokenPath, pageEvaluator })).toBe(answer);
+        expect(await runChatGptJob(citing(), { sessionTokenPath, pageEvaluator })).toBe(answer);
+      });
     });
   });
 

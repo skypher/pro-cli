@@ -14,6 +14,7 @@ import {
   resetAuthProfile,
   showProCliChromeWindow,
 } from "./auth";
+import { CITATION_MODES } from "./citations";
 import { loadConfig, migrateLegacyDefaultHome, resolvePaths, saveConfig } from "./config";
 import {
   archiveConversations,
@@ -796,6 +797,10 @@ async function collectRequestOptions(
     "none",
   ]);
   setStringOption(options, "toolChoice", flags, "tool-choice", ["auto", "none", "required"]);
+  // Web citations become [n] and a Sources list. odds and JSON answers are read by programs,
+  // so they only lose the markers.
+  setStringOption(options, "citations", flags, "citations", [...CITATION_MODES]);
+  options.citations ??= command === "odds" || flagString(flags, "schema") || flagString(flags, "format") ? "strip" : "numbered";
   setIntegerOption(options, "timeoutMs", flags, "timeout", 1, MAX_REQUEST_TIMEOUT_MS);
   setIntegerOption(options, "retries", flags, "retries", 0, 5);
   setIntegerOption(options, "retryDelayMs", flags, "retry-delay", 0, 60_000);
@@ -878,6 +883,7 @@ const ASK_REQUEST_FLAGS = new Set([
   "reasoning-summary",
   "tool-choice",
   "parallel-tools",
+  "citations",
   "instructions",
   "instructions-file",
   "timeout",
@@ -922,6 +928,7 @@ const ODDS_REQUEST_FLAGS = new Set([
   "reasoning-summary",
   "tool-choice",
   "parallel-tools",
+  "citations",
   "timeout",
   "retries",
   "retry-delay",

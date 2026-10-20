@@ -2,10 +2,11 @@ import { randomUUID } from "node:crypto";
 import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { evaluateInCdpPage, recoverCookieBloatInCdp } from "./cdp";
+import { citationMode, formatCitations, hasCitationSyntax } from "./citations";
 import { writePrivateFile } from "./config";
 import { chatGptOrigins } from "./cookies";
 import { DEFAULT_MODEL, isReasoningLevel } from "./defaults";
-import { DeltaStreamDecoder, type DecodedMessage } from "./delta-stream";
+import { decodeDeltaStream, DeltaStreamDecoder, type DecodedMessage } from "./delta-stream";
 import { EXIT, ProError } from "./errors";
 import type { JobRecord, KeptConversationReason, LimitsObservation } from "./jobs";
 import { canonicalModelId, modelUsesThinkingEffort } from "./models";
@@ -336,7 +337,6 @@ async function postChatGptJob(
           allowEmptyWithConversation: model === "image",
           legacyText: model === "image" || model === "research",
         });
-        await logCitations(options.diagnosticsDir, job, parsed.conversationId, summarizeCitations(browserResult.body, parsed.text));
       } catch (error) {
         // ChatGPT ended the turn with an error: the chat holds no answer to recover.
         if (error instanceof ProError && error.code === "UPSTREAM_ERROR") {
@@ -354,7 +354,7 @@ async function postChatGptJob(
           options,
         });
         keepReason = null;
-        return recovered;
+        return await formatAnswerCitations(job, recovered, () => decodeDeltaStream(browserResult.body, parseSseFrame).messages(), options);
       }
       if (model === "image") {
         if (parsed.text.toLowerCase().includes("image generation isn") && parsed.text.toLowerCase().includes("temporary chat")) {
@@ -420,11 +420,11 @@ async function postChatGptJob(
           options,
         });
         keepReason = answer.verified ? null : "unverified";
-        return answer.text;
+        return await formatAnswerCitations(job, answer.text, () => parsed.messages, options);
       }
       validateCompletedResult(job, parsed.text);
       keepReason = null;
-      return parsed.text;
+      return await formatAnswerCitations(job, parsed.text, () => parsed.messages, options);
     } finally {
       if (deleteAfter) await settleJobConversation(job, browserResult.body, keepReason, evaluate, cdpBase, options);
     }
@@ -1334,6 +1334,8 @@ interface ParsedConversationResponse {
   asyncTask: ResearchTask | null;
   deepResearchWidget: ResearchTask | null;
   conversationId: string | null;
+  /** Every message of the turn as the stream built it; citations resolve against their sources. */
+  messages: DecodedMessage[];
 }
 
 function readResponse(
@@ -1423,7 +1425,7 @@ function readResponse(
     });
   }
 
-  return { text: completedText ?? "", asyncTask, deepResearchWidget, conversationId };
+  return { text: completedText ?? "", asyncTask, deepResearchWidget, conversationId, messages: decoder.messages() };
 }
 
 // The answer is the assistant's message to the user that ends the turn. Fast models stream it
@@ -1655,97 +1657,32 @@ export async function readStoredAnswer(
   return await evaluate<ConversationAnswerFetchResult>(cdpBase, buildConversationAnswerFetchExpression(conversationId, 0), 30_000);
 }
 
-// ChatGPT marks citations in answer text with private-use characters: U+E200 opens a marker,
-// U+E202 separates its fields and U+E201 closes it, as in cite + turn0search3. The sources a
-// marker points to arrive in message.metadata.content_references. Until pro-cli turns them into
-// readable references, their shape is logged to citations.jsonl: marker fields and reference
-// field names, never titles, URLs, snippets or answer text.
-const CITATION_MARKER = /\uE200([^\uE200\uE201]*)\uE201/g;
-const CITATION_FIELD = /^[A-Za-z0-9_.:-]{1,80}$/;
-
-interface CitationReferenceShape {
-  type: string | null;
-  keys: string[];
-  matchedText: string[] | null;
-  itemCount: number;
-  itemKeys: string[];
-}
-
-interface CitationSummary {
-  markers: string[][];
-  references: CitationReferenceShape[];
-  patchPaths: string[];
-}
-
-function summarizeCitations(raw: string, text: string): CitationSummary {
-  const markers = [...text.matchAll(CITATION_MARKER)].map((match) => citationMarkerFields(match[1]));
-  const references = new Map<string, CitationReferenceShape>();
-  const patchPaths = new Set<string>();
-  const addReference = (value: unknown) => {
-    if (!isRecord(value)) return;
-    const items = Array.isArray(value.items) ? value.items.filter(isRecord) : [];
-    const shape: CitationReferenceShape = {
-      type: typeof value.type === "string" && CITATION_FIELD.test(value.type) ? value.type : null,
-      keys: Object.keys(value).sort(),
-      matchedText: typeof value.matched_text === "string" ? citationTextFields(value.matched_text) : null,
-      itemCount: items.length,
-      itemKeys: [...new Set(items.flatMap((item) => Object.keys(item)))].sort(),
-    };
-    references.set(JSON.stringify(shape), shape);
-  };
-  const visit = (value: unknown): void => {
-    if (Array.isArray(value)) {
-      value.forEach(visit);
-      return;
-    }
-    if (!isRecord(value)) return;
-    if (typeof value.p === "string" && value.p.includes("content_references")) {
-      patchPaths.add(`${typeof value.o === "string" ? value.o : "set"} ${value.p.replace(/\/\d+/g, "/N")}`);
-      if (/content_references$/.test(value.p) && Array.isArray(value.v)) value.v.forEach(addReference);
-      else if (/content_references\/\d+$/.test(value.p)) addReference(value.v);
-    }
-    for (const [key, child] of Object.entries(value)) {
-      if (key === "content_references" && Array.isArray(child)) child.forEach(addReference);
-      else visit(child);
-    }
-  };
-  for (const frame of raw.replace(/\r\n?/g, "\n").split("\n\n")) {
-    if (frame.includes("content_references")) visit(parseSseFrame(frame));
-  }
-  return { markers, references: [...references.values()], patchPaths: [...patchPaths].sort() };
-}
-
-function citationTextFields(text: string): string[] {
-  const match = /^\uE200([^\uE200\uE201]*)\uE201$/.exec(text);
-  return match ? citationMarkerFields(match[1]) : [`<text:${text.length}>`];
-}
-
-// Marker fields are identifiers (cite, turn0search3) or JSON holding them ({"citation":{"refs":[...]}}).
-function citationMarkerFields(inner: string): string[] {
-  return inner.split("\uE202").map((field) => {
-    if (CITATION_FIELD.test(field)) return field;
-    try {
-      const json = JSON.stringify(JSON.parse(field), (_key, value) =>
-        typeof value === "string" && !CITATION_FIELD.test(value) ? `<text:${value.length}>` : value);
-      if (json !== undefined) return json;
-    } catch {
-      // not JSON
-    }
-    return `<text:${field.length}>`;
-  });
-}
-
-async function logCitations(
-  dir: string | undefined,
+// Turns ChatGPT's citation markers into [n] references and a Sources list, or removes them,
+// as the job's citations option says (see src/citations.ts). citations.jsonl gets counts only.
+async function formatAnswerCitations(
   job: JobRecord,
-  conversationId: string | null,
-  summary: CitationSummary,
-): Promise<void> {
-  if (!dir || (summary.markers.length === 0 && summary.references.length === 0 && summary.patchPaths.length === 0)) return;
+  text: string,
+  messages: () => DecodedMessage[],
+  options: TransportOptions,
+): Promise<string> {
+  const mode = citationMode(job.options.citations);
+  if (mode === "raw" || !hasCitationSyntax(text)) return text;
+  let formatted: ReturnType<typeof formatCitations>;
+  try {
+    formatted = formatCitations(text, messages(), mode);
+  } catch {
+    return text;
+  }
+  await logCitations(options.diagnosticsDir, job, { mode, ...formatted.stats });
+  return formatted.text;
+}
+
+async function logCitations(dir: string | undefined, job: JobRecord, record: Record<string, unknown>): Promise<void> {
+  if (!dir) return;
   try {
     await mkdir(dir, { recursive: true, mode: 0o700 });
-    const record = { jobId: job.id, conversationId, recordedAt: new Date().toISOString(), ...summary };
-    await appendFile(join(dir, "citations.jsonl"), `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    const line = { jobId: job.id, recordedAt: new Date().toISOString(), ...record };
+    await appendFile(join(dir, "citations.jsonl"), `${JSON.stringify(line)}\n`, { mode: 0o600 });
   } catch {
     // best effort; the job result matters more than this record
   }

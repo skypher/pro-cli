@@ -703,6 +703,18 @@ describe("robot-mode CLI", () => {
     });
   });
 
+  test("job create stores the citations mode: numbered unless --citations says otherwise", async () => {
+    await withHome(async (home) => {
+      const plain = await run(["job", "create", "hello", "--no-start", "--json"], { tty: true, home });
+      expect(JSON.parse(plain.stdout).data.job.options.citations).toBe("numbered");
+      const raw = await run(["job", "create", "hello", "--no-start", "--citations", "raw", "--json"], { tty: true, home });
+      expect(JSON.parse(raw.stdout).data.job.options.citations).toBe("raw");
+      const bad = await run(["job", "create", "hello", "--no-start", "--citations", "links", "--json"], { tty: true, home });
+      expect(bad.code).not.toBe(0);
+      expect(bad.stderr).toContain("Invalid --citations.");
+    });
+  });
+
   test("--chat-only refuses Deep Research and image models under any alias", async () => {
     await withHome(async (home) => {
       for (const [command, model] of [

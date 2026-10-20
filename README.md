@@ -378,6 +378,7 @@ pro-cli models --json
 --reasoning-summary auto|concise|detailed|none
 --tool-choice auto|none|required
 --parallel-tools true|false
+--citations numbered|strip|raw
 --timeout <ms>
 --retries <0..5>
 --retry-delay <ms>
@@ -389,6 +390,13 @@ pro-cli models --json
 Connectors such as GitHub only work in saved chats; ChatGPT turns them off in temporary chats. `--save --delete-conversation` runs a chat-model request as a saved chat and deletes it once the answer is safe. The answer is checked against ChatGPT's stored copy before the chat goes, because a deleted chat can never be read again. A job that fails, or whose stored copy cannot be read, keeps its chat for up to six hours (`kept-conversations.jsonl`). Meanwhile the daemon looks at kept chats every ten minutes and deletes each one after storing its answer, or once the answer turns out empty or the six hours are up:
 - a failed job whose answer turns up becomes succeeded with it;
 - an unchecked answer that differs from the stored copy is replaced by it.
+
+Answers that cite web sources come with citation markers, which ChatGPT writes as invisible characters (U+E200 to U+E202) or as `<Cite ref="..."/>` and `<Link url="..." title="..."/>` tags. `--citations` sets what happens to them:
+- `numbered` (the default for `ask` and `job create`) turns each citation into `[1]`, `[2]` and ends the answer with a Sources list of titles and URLs;
+- `strip` (the default for `odds`, `--schema` and `--format`, whose answers programs read) removes them;
+- `raw` leaves the answer as ChatGPT sent it.
+
+In `numbered` and `strip` mode a `<Link>` tag becomes a Markdown link. The sources come from the search results in the answer's stream; a citation with none is removed. `citations.jsonl` records how many citations each answer had and how many were resolved, but never titles, URLs or answer text.
 
 Recovered answers are logged in `recovered-answers.jsonl`. A chat that could not be deleted goes to `undeleted-conversations.jsonl`. All these logs are in `~/.pro-cli/diagnostics/`. When ChatGPT rate-limits chat reads, the 429's Retry-After pauses the reads of every job using the same browser. `--preamble` text goes ahead of `--instructions` and the prompt.
 

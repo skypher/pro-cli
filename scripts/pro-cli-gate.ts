@@ -118,6 +118,7 @@ const REQUEST_FLAGS = [
   "reasoning-summary",
   "tool-choice",
   "parallel-tools",
+  "citations",
   "timeout",
   "retries",
   "retry-delay",

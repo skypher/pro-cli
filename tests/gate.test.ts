@@ -207,6 +207,17 @@ describe("gate commands", () => {
     await gate("pro-cli daemon status");
     expect(calls[2].argv).toEqual(["/fake/bun", "/fake/cli.ts", "daemon", "status", "--json"]);
   });
+
+  test("passes --citations through for ask, job create and odds", async () => {
+    for (const line of ["pro-cli ask --citations raw hello", "pro-cli job create --citations=strip hello", "pro-cli odds --citations numbered question"]) {
+      expect((await gate(line)).code).toBe(0);
+    }
+    expect(calls.map((call) => call.argv.find((arg) => arg.startsWith("--citations")))).toEqual([
+      "--citations=raw",
+      "--citations=strip",
+      "--citations=numbered",
+    ]);
+  });
 });
 
 describe("--github", () => {
