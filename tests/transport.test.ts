@@ -1134,6 +1134,57 @@ describe("ChatGPT transport", () => {
     });
   });
 
+  test("reads answer text sent in patch continuation frames", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const body = [
+        'event: delta_encoding\ndata: "v1"',
+        'event: delta\ndata: {"p":"","o":"add","v":{"message":{"id":"m1","author":{"role":"assistant"},"channel":"final","recipient":"all","content":{"content_type":"text","parts":[""]},"status":"in_progress"},"conversation_id":"conv_patch"},"c":3}',
+        'event: delta\ndata: {"o":"patch","v":[{"p":"/message/content/parts/0","o":"append","v":"One"},{"p":"/message/metadata/content_references","o":"append","v":[]}]}',
+        'event: delta\ndata: {"v":[{"p":"/message/content/parts/0","o":"append","v":" two"}]}',
+        'data: {"type":"url_moderation","conversation_id":"conv_patch"}',
+        'event: delta\ndata: {"v":[{"p":"/message/content/parts/0","o":"append","v":" three."},{"p":"/message/status","o":"replace","v":"finished_successfully"},{"p":"/message/end_turn","o":"replace","v":true}]}',
+        'data: {"type":"message_stream_complete","conversation_id":"conv_patch"}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n");
+      const pageEvaluator = (async <T>(): Promise<T> => ({ ok: true, status: 200, body }) as T);
+
+      expect(await runChatGptJob(job(), { sessionTokenPath, pageEvaluator })).toBe("One two three.");
+    });
+  });
+
+  test("takes the joined answer once when a fast model streams it twice and the hand-off replays it", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const assistant = (id: string, c: number) =>
+        `event: delta\ndata: {"v":{"message":{"id":"${id}","author":{"role":"assistant"},"channel":"final","recipient":"all","content":{"content_type":"text","parts":[""]},"status":"in_progress"},"conversation_id":"conv_fast"},"c":${c}}`;
+      const append = (c: number, text: string) =>
+        `event: delta\ndata: {"c":${c},"o":"patch","v":[{"p":"/message/content/parts/0","o":"append","v":${JSON.stringify(text)}}]}`;
+      const finish = (c: number, endTurn: boolean) =>
+        `event: delta\ndata: {"c":${c},"v":[{"p":"/message/status","o":"replace","v":"finished_successfully"},{"p":"/message/end_turn","o":"replace","v":${endTurn}}]}`;
+      const segment = [
+        'event: delta_encoding\ndata: "v1"',
+        'event: delta\ndata: {"p":"","o":"add","v":{"message":{"id":"u","author":{"role":"user"},"content":{"content_type":"text","parts":["question"]},"status":"finished_successfully"},"conversation_id":"conv_fast"},"c":0}',
+        assistant("first-search", 1),
+        assistant("joined", 2),
+        append(1, "Bun 1.4.3 is out. "),
+        append(2, "Bun 1.4.3 is out. "),
+        finish(1, false),
+        `event: delta\ndata: {"p":"","o":"add","v":{"message":{"id":"second-search","author":{"role":"assistant"},"channel":"final","recipient":"all","content":{"content_type":"text","parts":[""]},"status":"in_progress"},"conversation_id":"conv_fast"},"c":3}`,
+        'data: {"type":"streaming_parent_patch","conversation_id":"conv_fast","logical_answer_id":"joined","revision":1,"updates":[]}',
+        append(3, "It checks types."),
+        append(2, "It checks types."),
+        finish(3, true),
+        finish(2, true),
+        'data: {"type":"message_stream_complete","conversation_id":"conv_fast"}',
+        "data: [DONE]",
+      ];
+      const body = [...segment, ...segment, ""].join("\n\n");
+      const pageEvaluator = (async <T>(): Promise<T> => ({ ok: true, status: 200, body }) as T);
+
+      expect(await runChatGptJob(job(), { sessionTokenPath, pageEvaluator })).toBe("Bun 1.4.3 is out. It checks types.");
+    });
+  });
+
   test("logs the shape of citation markers and their references, without titles, URLs or answer text", async () => {
     await withTokenFile(async (sessionTokenPath) => {
       const diagnosticsDir = await mkdtemp(join(tmpdir(), "pro-citations-"));

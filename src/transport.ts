@@ -5,6 +5,7 @@ import { evaluateInCdpPage, recoverCookieBloatInCdp } from "./cdp";
 import { writePrivateFile } from "./config";
 import { chatGptOrigins } from "./cookies";
 import { DEFAULT_MODEL, isReasoningLevel } from "./defaults";
+import { DeltaStreamDecoder, type DecodedMessage } from "./delta-stream";
 import { EXIT, ProError } from "./errors";
 import type { JobRecord, KeptConversationReason, LimitsObservation } from "./jobs";
 import { canonicalModelId, modelUsesThinkingEffort } from "./models";
@@ -333,6 +334,7 @@ async function postChatGptJob(
       try {
         parsed = readResponse(browserResult.body, options.onLimits, {
           allowEmptyWithConversation: model === "image",
+          legacyText: model === "image" || model === "research",
         });
         await logCitations(options.diagnosticsDir, job, parsed.conversationId, summarizeCitations(browserResult.body, parsed.text));
       } catch (error) {
@@ -1337,8 +1339,11 @@ interface ParsedConversationResponse {
 function readResponse(
   raw: string,
   onLimits?: (observations: LimitsObservation[]) => void,
-  options: { allowEmptyWithConversation?: boolean } = {},
+  // legacyText keeps the text every streamed message appended, which Deep Research's tool call
+  // and image replies are read from; chat answers come from the answer message itself.
+  options: { allowEmptyWithConversation?: boolean; legacyText?: boolean } = {},
 ): ParsedConversationResponse {
+  const decoder = new DeltaStreamDecoder();
   let buffer = raw.replace(/\r\n?/g, "\n");
   let completedText: string | null = null;
   let asyncTask: ResearchTask | null = null;
@@ -1354,6 +1359,7 @@ function readResponse(
     buffer = buffer.slice(boundary + 2);
     const event = parseSseFrame(frame);
     turnError ??= readTurnError(event);
+    decoder.apply(event);
     const parsed = readConversationEvent(event, state);
     if (parsed.text !== null) {
       completedText = mergeStreamText(completedText, parsed.text, parsed.append);
@@ -1372,6 +1378,7 @@ function readResponse(
   if (buffer.trim()) {
     const event = parseSseFrame(buffer);
     turnError ??= readTurnError(event);
+    decoder.apply(event);
     const parsed = readConversationEvent(event, state);
     if (parsed.text !== null) {
       completedText = mergeStreamText(completedText, parsed.text, parsed.append);
@@ -1385,6 +1392,9 @@ function readResponse(
     deepResearchWidget = extractDeepResearchWidgetTask(event, conversationId) ?? deepResearchWidget;
     completed = startsStreamSegment(buffer) ? false : completed || parsed.completed;
   }
+
+  const answerText = options.legacyText ? null : decodedAnswerText(decoder);
+  if (answerText?.trim()) completedText = answerText;
 
   // A refused turn (a usage cap, for example) has an error frame and no answer; polling
   // the chat for one would wait hours for nothing.
@@ -1414,6 +1424,27 @@ function readResponse(
   }
 
   return { text: completedText ?? "", asyncTask, deepResearchWidget, conversationId };
+}
+
+// The answer is the assistant's message to the user that ends the turn. Fast models stream it
+// into two messages at once, and streaming_parent_patch names the one that joins them.
+function decodedAnswerText(decoder: DeltaStreamDecoder): string | null {
+  const textOf = (decoded: DecodedMessage) => readMessageContentText(decoded.root.message) ?? "";
+  const answers = decoder.messages().filter((decoded) => isAnswerMessage(decoded.root.message));
+  const logical = answers.find((decoded) => (decoded.root.message as Record<string, unknown>).id === decoder.logicalAnswerId);
+  if (logical) return textOf(logical);
+  const withText = answers.filter((decoded) => textOf(decoded).trim());
+  const ended = withText.filter((decoded) => (decoded.root.message as Record<string, unknown>).end_turn === true);
+  const pool = ended.length > 0 ? ended : withText;
+  if (pool.length === 0) return null;
+  return textOf(pool.reduce((latest, decoded) => (decoded.touched > latest.touched ? decoded : latest)));
+}
+
+function isAnswerMessage(message: unknown): boolean {
+  if (!isRecord(message)) return false;
+  const author = isRecord(message.author) ? message.author : {};
+  if (author.role !== "assistant" || isProgressNote(message)) return false;
+  return message.recipient === undefined || message.recipient === null || message.recipient === "all";
 }
 
 // The body holds the first response and then the stream it handed off to, each opening
