@@ -1408,6 +1408,23 @@ describe("ChatGPT transport", () => {
     });
   });
 
+  test("a 403 for unusual activity gets its own code and is not retried; other 403s stay UPSTREAM_REJECTED", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      let calls = 0;
+      const refusal = (body: string) => (async <T>(): Promise<T> => {
+        calls += 1;
+        return { ok: false, status: 403, body } as T;
+      }) as PageEvaluator;
+      const codeOf = (promise: Promise<unknown>) => promise.then(() => null, (error: ProError) => error.code);
+
+      const unusual = refusal('{"detail":"Unusual activity has been detected from your device. Try again later. (8d1e)"}');
+      expect(await codeOf(runChatGptJob(job(), { sessionTokenPath, pageEvaluator: unusual, retries: 2, retryDelayMs: 0 }))).toBe("CHATGPT_UNUSUAL_ACTIVITY");
+      expect(calls).toBe(1);
+      const other = refusal('{"detail":"Forbidden"}');
+      expect(await codeOf(runChatGptJob(job(), { sessionTokenPath, pageEvaluator: other }))).toBe("UPSTREAM_REJECTED");
+    });
+  });
+
   test("fails early when the CDP ChatGPT page is logged out", async () => {
     await withTokenFile(async (sessionTokenPath) => {
       const pageEvaluator = (async <T>(): Promise<T> =>

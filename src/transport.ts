@@ -314,6 +314,23 @@ async function postChatGptJob(
       );
     }
 
+    // ChatGPT's abuse check answers with a 403 instead of a stream:
+    // {"detail":"Unusual activity has been detected from your device. Try again later. (<id>)"}.
+    if (browserResult.status === 403 && /unusual activity/i.test(browserResult.body.slice(0, 2000))) {
+      throw new ProError(
+        "CHATGPT_UNUSUAL_ACTIVITY",
+        "ChatGPT refused the request because it detected unusual activity from this browser. Try again later.",
+        {
+          exitCode: EXIT.upstream,
+          suggestions: [
+            "Wait several minutes, then send the same request again; ChatGPT gives no retry time.",
+            "Do not send probe or smoke-test queries to check; they add to the activity.",
+          ],
+          details: { status: 403, preview: browserResult.body.slice(0, 160).replace(/\s+/g, " ") },
+        },
+      );
+    }
+
     if (!browserResult.ok) {
       throw new ProError("UPSTREAM_REJECTED", `ChatGPT backend returned HTTP ${browserResult.status}.`, {
         exitCode: EXIT.upstream,

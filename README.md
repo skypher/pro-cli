@@ -264,6 +264,8 @@ Returns:
 
 ChatGPT does not expose a standalone limits endpoint, so counters refresh whenever you make a real Pro call. General Pro chat throttling is adaptive and not exposed by any endpoint we found.
 
+ChatGPT's abuse check can also refuse a single request with HTTP 403 ("Unusual activity has been detected from your device. Try again later."). pro-cli reports that as `CHATGPT_UNUSUAL_ACTIVITY` and does not retry it; send the request again after several minutes. Other refusals stay `UPSTREAM_REJECTED`.
+
 ### Usage-limit watch
 
 When the account's usage limit is reached, ChatGPT refuses every request with `UPSTREAM_ERROR` and `details.errorCode: usage_limit` ("You've hit your limit. Please try again later."), and it gives no reset time.
