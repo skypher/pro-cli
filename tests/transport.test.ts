@@ -1243,7 +1243,19 @@ describe("ChatGPT transport", () => {
             "",
           ].join("\n"));
           const log = await readFile(join(diagnosticsDir, "citations.jsonl"), "utf8");
-          expect(JSON.parse(log)).toMatchObject({ jobId: "job_test", mode: "numbered", citations: 4, resolved: 3, links: 1, sources: 3, otherKinds: [] });
+          expect(JSON.parse(log)).toMatchObject({
+            jobId: "job_test",
+            mode: "numbered",
+            citations: 4,
+            resolved: 3,
+            links: 1,
+            sources: 3,
+            otherKinds: [],
+            unresolvedRefTypes: { search: 1 },
+            unresolvedInUnknownTurns: 1,
+            unresolvedWithEntry: 0,
+            indexedRefTypes: { search: 2, view: 2 },
+          });
           expect(log).not.toContain("bun.com");
           expect(log).not.toContain("Releases");
         } finally {

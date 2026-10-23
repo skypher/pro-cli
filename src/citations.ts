@@ -25,6 +25,14 @@ export interface CitationStats {
   sources: number;
   /** Kinds of private-use markers left in place or replaced by alt text, e.g. "entity". */
   otherKinds: string[];
+  /** Ref types of citations that found no source ("none": the citation named no ref). */
+  unresolvedRefTypes: Record<string, number>;
+  /** Refs among those whose turn has no source at all in the stream. */
+  unresolvedInUnknownTurns: number;
+  /** Unresolved markers that have a content_references entry, just no usable items. */
+  unresolvedWithEntry: number;
+  /** Ref types the stream has sources for. */
+  indexedRefTypes: Record<string, number>;
 }
 
 interface Source {
@@ -38,6 +46,7 @@ const MARKER_OR_TAG = /([ \t]*)(?:\uE200([^\uE200\uE201]*)\uE201|<(Cite|Link)\b(
 // Fenced and inline code keep their tags: an answer can show <Link .../> as an example.
 const CODE = /```[\s\S]*?(?:```|$)|`[^`\n]*`/g;
 const REF = /turn\d+[a-z_]+\d+/g;
+const REF_PARTS = /^turn(\d+)([a-z_]+)(\d+)$/;
 const KIND = /^[a-z][a-z0-9_]{0,31}$/;
 
 export function hasCitationSyntax(text: string): boolean {
@@ -53,12 +62,23 @@ export function formatCitations(
   messages: DecodedMessage[],
   mode: CitationMode,
 ): { text: string; stats: CitationStats } {
-  const stats: CitationStats = { citations: 0, resolved: 0, links: 0, sources: 0, otherKinds: [] };
+  const stats: CitationStats = {
+    citations: 0,
+    resolved: 0,
+    links: 0,
+    sources: 0,
+    otherKinds: [],
+    unresolvedRefTypes: {},
+    unresolvedInUnknownTurns: 0,
+    unresolvedWithEntry: 0,
+    indexedRefTypes: {},
+  };
   if (mode === "raw" || !hasCitationSyntax(text)) return { text, stats };
   const index = indexSources(messages);
   const numbers = new Map<string, number>();
   const listed: Source[] = [];
   const otherKinds = new Set<string>();
+  const unresolvedRefTypes = new Map<string, number>();
 
   const replace = (whole: string, lead: string, marker: string | undefined, tag: string | undefined, attributes: string | undefined) => {
     if (tag === "Link") {
@@ -87,6 +107,15 @@ export function formatCitations(
     stats.citations += 1;
     const sources = uniqueSources([...refs.map((ref) => index.byRef.get(ref)).filter((source) => source !== undefined), ...matched]);
     if (sources.length > 0) stats.resolved += 1;
+    else {
+      if (marker !== undefined && index.entries.has(marker)) stats.unresolvedWithEntry += 1;
+      if (refs.length === 0) count(unresolvedRefTypes, "none");
+      for (const ref of refs) {
+        const parts = REF_PARTS.exec(ref);
+        count(unresolvedRefTypes, parts ? parts[2] : "?");
+        if (parts && !index.turns.has(parts[1])) stats.unresolvedInUnknownTurns += 1;
+      }
+    }
     if (mode === "strip" || sources.length === 0) return "";
     return `${lead}${sources
       .map((source) => {
@@ -111,6 +140,8 @@ export function formatCitations(
 
   stats.sources = listed.length;
   stats.otherKinds = [...otherKinds].sort();
+  stats.unresolvedRefTypes = Object.fromEntries(unresolvedRefTypes);
+  stats.indexedRefTypes = Object.fromEntries(index.refTypes);
   if (listed.length > 0) {
     const lines = listed.map((source, i) => `[${i + 1}] ${source.title ? `${source.title} — ` : ""}${source.url}`);
     output = `${output.trimEnd()}\n\nSources:\n${lines.join("\n")}\n`;
@@ -122,10 +153,22 @@ interface SourceIndex {
   byRef: Map<string, Source>;
   byMarker: Map<string, Source[]>;
   altByMarker: Map<string, string>;
+  /** Markers with a content_references entry, by the text between their delimiters. */
+  entries: Set<string>;
+  /** Turn indexes and ref types (with counts) that have sources. */
+  turns: Set<string>;
+  refTypes: Map<string, number>;
 }
 
 function indexSources(messages: DecodedMessage[]): SourceIndex {
-  const index: SourceIndex = { byRef: new Map(), byMarker: new Map(), altByMarker: new Map() };
+  const index: SourceIndex = {
+    byRef: new Map(),
+    byMarker: new Map(),
+    altByMarker: new Map(),
+    entries: new Set(),
+    turns: new Set(),
+    refTypes: new Map(),
+  };
   const visit = (value: unknown, depth: number): void => {
     if (depth > 40) return;
     if (Array.isArray(value)) {
@@ -143,11 +186,18 @@ function indexSources(messages: DecodedMessage[]): SourceIndex {
     if (typeof value.matched_text === "string" && value.matched_text.startsWith("\uE200")) {
       const items = Array.isArray(value.items) ? value.items.map(sourceOf).filter((item) => item !== null) : [];
       if (items.length > 0) index.byMarker.set(value.matched_text, items);
+      index.entries.add(value.matched_text.slice(1, -1));
       if (typeof value.alt === "string") index.altByMarker.set(value.matched_text, value.alt);
     }
     for (const child of Object.values(value)) visit(child, depth + 1);
   };
   for (const message of messages) visit(message.root, 0);
+  for (const ref of index.byRef.keys()) {
+    const parts = REF_PARTS.exec(ref);
+    if (!parts) continue;
+    index.turns.add(parts[1]);
+    count(index.refTypes, parts[2]);
+  }
   return index;
 }
 
@@ -216,6 +266,10 @@ function markdownLink(url: string | null, title: string | null): string {
   const clean = cleanUrl(url);
   if (!title?.trim()) return `<${clean}>`;
   return `[${title.trim().replace(/([[\]])/g, "\\$1")}](${clean.replace(/\)/g, "%29")})`;
+}
+
+function count(counts: Map<string, number>, key: string): void {
+  counts.set(key, (counts.get(key) ?? 0) + 1);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

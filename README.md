@@ -396,7 +396,7 @@ Answers that cite web sources come with citation markers, which ChatGPT writes a
 - `strip` (the default for `odds`, `--schema` and `--format`, whose answers programs read) removes them;
 - `raw` leaves the answer as ChatGPT sent it.
 
-In `numbered` and `strip` mode a `<Link>` tag becomes a Markdown link. The sources come from the search results in the answer's stream; a citation with none is removed. `citations.jsonl` records how many citations each answer had and how many were resolved, but never titles, URLs or answer text.
+In `numbered` and `strip` mode a `<Link>` tag becomes a Markdown link. The sources come from the search results in the answer's stream; a citation with none is removed. `citations.jsonl` records how many citations each answer had and how many were resolved, but never titles, URLs or answer text. For the citations that found no source, it records their ref types (`search`, `view`, ...), how many name a turn that has no sources in the stream, and how many have a citation entry without usable sources.
 
 Recovered answers are logged in `recovered-answers.jsonl`. A chat that could not be deleted goes to `undeleted-conversations.jsonl`. All these logs are in `~/.pro-cli/diagnostics/`. When ChatGPT rate-limits chat reads, the 429's Retry-After pauses the reads of every job using the same browser. `--preamble` text goes ahead of `--instructions` and the prompt.
 
