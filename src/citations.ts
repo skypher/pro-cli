@@ -105,7 +105,7 @@ export function formatCitations(
       refs = (attributes ?? "").match(REF) ?? [];
     }
     stats.citations += 1;
-    const sources = uniqueSources([...refs.map((ref) => index.byRef.get(ref)).filter((source) => source !== undefined), ...matched]);
+    const sources = uniqueSources([...refs.map((ref) => resolveRef(index, ref)).filter((source) => source !== undefined), ...matched]);
     if (sources.length > 0) stats.resolved += 1;
     else {
       if (marker !== undefined && index.entries.has(marker)) stats.unresolvedWithEntry += 1;
@@ -157,6 +157,8 @@ interface SourceIndex {
   entries: Set<string>;
   /** Turn indexes and ref types (with counts) that have sources. */
   turns: Set<string>;
+  /** Sources by ref type and index alone (search8), null where two turns disagree. */
+  byTypeIndex: Map<string, Source | null>;
   refTypes: Map<string, number>;
 }
 
@@ -167,6 +169,7 @@ function indexSources(messages: DecodedMessage[]): SourceIndex {
     altByMarker: new Map(),
     entries: new Set(),
     turns: new Set(),
+    byTypeIndex: new Map(),
     refTypes: new Map(),
   };
   const visit = (value: unknown, depth: number): void => {
@@ -196,9 +199,24 @@ function indexSources(messages: DecodedMessage[]): SourceIndex {
     const parts = REF_PARTS.exec(ref);
     if (!parts) continue;
     index.turns.add(parts[1]);
+    const source = index.byRef.get(ref) as Source;
+    const typeIndex = `${parts[2]}${parts[3]}`;
+    const known = index.byTypeIndex.get(typeIndex);
+    index.byTypeIndex.set(typeIndex, known === undefined || known?.url === source.url ? source : null);
     count(index.refTypes, parts[2]);
   }
   return index;
+}
+
+// A chat's stored copy numbers its turns again (turn0search8) while the answer text keeps the
+// stream's numbers (turn730769search8), so a ref whose turn has no sources at all falls back to
+// its type and index, when only one source has them.
+function resolveRef(index: SourceIndex, ref: string): Source | undefined {
+  const exact = index.byRef.get(ref);
+  if (exact) return exact;
+  const parts = REF_PARTS.exec(ref);
+  if (!parts || index.turns.has(parts[1])) return undefined;
+  return index.byTypeIndex.get(`${parts[2]}${parts[3]}`) ?? undefined;
 }
 
 function sourceOf(value: unknown): Source | null {

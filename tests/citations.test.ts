@@ -32,13 +32,22 @@ describe("formatCitations", () => {
     const marker = (...fields: string[]) => String.fromCharCode(0xe200) + fields.join(String.fromCharCode(0xe202)) + String.fromCharCode(0xe201);
     const withEntry = marker("cite", "turn0view5");
     const messages = [...sources, ...turn({ content_references: [{ matched_text: withEntry, items: [] }] })];
-    const text = `A ${withEntry} B ${marker("cite", "turn3search0", "turn3__proto__1")} C <Cite/> D`;
+    const text = `A ${withEntry} B ${marker("cite", "turn3search5", "turn3__proto__1")} C <Cite/> D`;
     const { text: formatted, stats } = formatCitations(text, messages, "numbered");
     expect(formatted).toBe("A B C D");
     expect(stats).toMatchObject({ citations: 3, resolved: 0, unresolvedInUnknownTurns: 2, unresolvedWithEntry: 1, indexedRefTypes: { search: 2 } });
     // A ref type spelled __proto__ is counted as a key and leaves the prototype alone.
     expect(Object.entries(stats.unresolvedRefTypes)).toEqual([["view", 1], ["search", 1], ["__proto__", 1], ["none", 1]]);
     expect(Object.getPrototypeOf(stats.unresolvedRefTypes)).toBe(Object.prototype);
+  });
+
+  test("a ref from a renumbered turn falls back to its type and index when only one source has them", () => {
+    const entry = (turn: number, index: number, url: string) => ({ url, title: url, ref_id: { turn_index: turn, ref_type: "search", ref_index: index } });
+    const stored = turn({ search_result_groups: [{ entries: [entry(0, 8, "https://a.example/eight"), entry(0, 9, "https://a.example/nine"), entry(1, 9, "https://b.example/nine")] }] });
+    const { text, stats } = formatCitations('A <Cite refs={["turn730769search8"]}/> B <Cite ref="turn730769search9"/> C <Cite ref="turn1search8"/> D', stored, "strip");
+    expect(text).toBe("A B C D");
+    // search8 is unique; search9 differs between turns 0 and 1; turn 1 has sources, so turn1search8 does not fall back.
+    expect(stats).toMatchObject({ citations: 3, resolved: 1, unresolvedRefTypes: { search: 2 } });
   });
 
   test("leaves tags in code alone", () => {
