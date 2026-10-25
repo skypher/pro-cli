@@ -4,9 +4,12 @@ import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/pro
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runHealthCheck, type HealthDeps, type HealthPaths, type PageSession } from "../scripts/pro-cli-health-check";
-import { DEFAULT_CONFIG, type LimitWatchConfig } from "../scripts/pro-cli-limit-watch";
+import { DEFAULT_CONFIG, mailOrigin, type LimitWatchConfig } from "../scripts/pro-cli-limit-watch";
 import { ProError } from "../src/errors";
 import { JobStore } from "../src/jobs";
+
+// Every mail subject starts with [user@hostname] of the machine sending it.
+const tag = `[${mailOrigin()}] `;
 
 const HOUR = 60 * 60_000;
 let root: string;
@@ -139,7 +142,8 @@ describe("health check", () => {
     await check();
     now = new Date(now.getTime() + 12 * HOUR);
     await check();
-    expect(subjects()).toEqual(["Subject: pro-cli health: Chrome's CDP port does not answer"]);
+    expect(subjects()).toEqual([`Subject: ${tag}pro-cli health: Chrome's CDP port does not answer`]);
+    expect(sent.mail[0]).toContain(`(scripts/pro-cli-health-check.ts) as ${mailOrigin()}.`);
     expect(sent.ntfy).toHaveLength(1);
 
     world.cdpUp = true;
@@ -174,7 +178,7 @@ describe("health check", () => {
     await rm(paths.token);
     world.page = { status: "logged_out" };
     await check();
-    expect(subjects()).toEqual(["Subject: pro-cli health: 2 problems"]);
+    expect(subjects()).toEqual([`Subject: ${tag}pro-cli health: 2 problems`]);
     expect(sent.mail[0]).toContain("The ChatGPT page is logged out");
     expect(sent.mail[0]).toContain("No stored session token");
   });

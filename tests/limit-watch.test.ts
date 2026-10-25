@@ -1,11 +1,14 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_CONFIG, loadConfig, runLimitWatch, type LimitWatchConfig, type LimitWatchPaths } from "../scripts/pro-cli-limit-watch";
+import { DEFAULT_CONFIG, loadConfig, mailOrigin, runLimitWatch, type LimitWatchConfig, type LimitWatchPaths } from "../scripts/pro-cli-limit-watch";
 import { ProError } from "../src/errors";
 import { JobStore } from "../src/jobs";
+
+// Every mail subject starts with [user@hostname] of the machine sending it.
+const tag = `[${mailOrigin()}] `;
 
 let root: string;
 let paths: LimitWatchPaths;
@@ -103,7 +106,8 @@ describe("usage-limit watch", () => {
     expect(sent.mail).toHaveLength(1);
     expect(sent.mail[0]).toContain("To: owner@example.com");
     expect(sent.mail[0]).toContain("From: watch@example.com");
-    expect(sent.mail[0]).toContain("Subject: ChatGPT usage limit hit");
+    expect(sent.mail[0]).toContain(`Subject: ${tag}ChatGPT usage limit hit`);
+    expect(sent.mail[0]).toContain(`(scripts/pro-cli-limit-watch.ts) as ${mailOrigin()}.`);
     expect(sent.mail[0]).toContain("USAGE_LIMIT_PAUSED");
     expect(sent.ntfy).toEqual([{ body: expect.stringContaining("usage limit hit"), headers: { Tags: "warning", Title: "watch host" } }]);
     expect(sent.probes).toEqual([]);
@@ -159,7 +163,7 @@ describe("usage-limit watch", () => {
     await watch();
 
     expect(sent.mail).toHaveLength(1);
-    expect(sent.mail[0]).toContain("Subject: ChatGPT usage limit lifted");
+    expect(sent.mail[0]).toContain(`Subject: ${tag}ChatGPT usage limit lifted`);
     expect(sent.mail[0]).toContain("Refusals:        2 usage_limit refusals");
     expect(sent.mail[0]).toContain("Gate key tester: 2 failed jobs since then");
     expect(sent.mail[0]).not.toContain("secret answer text");
@@ -174,14 +178,14 @@ describe("usage-limit watch", () => {
 
     await jobs([{ status: "succeeded", created: 10, updated: 5, model: "gpt-5-5" }]);
     await watch();
-    expect(sent.mail.map((mail) => mail.match(/Subject: .*/)?.[0])).toEqual(["Subject: ChatGPT usage limit hit"]);
+    expect(sent.mail.map((mail) => mail.match(/Subject: .*/)?.[0])).toEqual([`Subject: ${tag}ChatGPT usage limit hit`]);
     expect(sent.ntfy).toHaveLength(1);
 
     await jobs([{ status: "succeeded", created: 4, updated: 2 }]);
     await watch();
     expect(sent.mail.map((mail) => mail.match(/Subject: .*/)?.[0])).toEqual([
-      "Subject: ChatGPT usage limit hit",
-      "Subject: ChatGPT usage limit lifted",
+      `Subject: ${tag}ChatGPT usage limit hit`,
+      `Subject: ${tag}ChatGPT usage limit lifted`,
     ]);
   });
 
@@ -201,7 +205,7 @@ describe("usage-limit watch", () => {
       { status: "failed", errorCode: "usage_limit", created: 31, updated: 30 },
     ]);
     await watch();
-    expect(sent.mail.map((mail) => mail.match(/Subject: .*/)?.[0])).toEqual(["Subject: ChatGPT usage limit hit"]);
+    expect(sent.mail.map((mail) => mail.match(/Subject: .*/)?.[0])).toEqual([`Subject: ${tag}ChatGPT usage limit hit`]);
   });
 
   test("retries only the channel that failed", async () => {
@@ -240,4 +244,8 @@ describe("usage-limit watch", () => {
     await watch();
     expect(sent).toMatchObject({ mail: [], ntfy: [], probes: [] });
   });
+});
+
+test("mail names the user and hostname of the machine sending it", () => {
+  expect(mailOrigin()).toBe(`${userInfo().username}@${hostname()}`);
 });

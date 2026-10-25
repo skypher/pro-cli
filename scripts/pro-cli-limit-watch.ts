@@ -27,7 +27,7 @@
 
 import { Database } from "bun:sqlite";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, hostname, userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import { resolvePaths } from "../src/config";
 
@@ -275,11 +275,23 @@ function liftedNotice(episode: Episode, by: string, at: string, config: LimitWat
   };
 }
 
+/** user@hostname of the machine sending, read when the mail is sent; every mail subject starts with it. */
+export function mailOrigin(): string {
+  let user = process.env.USER ?? "unknown";
+  try {
+    user = userInfo().username;
+  } catch {
+    // no passwd entry; keep $USER
+  }
+  return `${user}@${hostname()}`;
+}
+
 function mailMessage(notice: Notice, config: LimitWatchConfig): string {
+  const origin = mailOrigin();
   return [
     `To: ${config.mail.to}`,
     ...(config.mail.from ? [`From: ${config.mail.from}`] : []),
-    `Subject: ${notice.subject}`,
+    `Subject: [${origin}] ${notice.subject}`,
     `Date: ${new Date().toUTCString()}`,
     "MIME-Version: 1.0",
     "Content-Type: text/plain; charset=utf-8",
@@ -287,7 +299,7 @@ function mailMessage(notice: Notice, config: LimitWatchConfig): string {
     "",
     ...notice.lines,
     "",
-    "Sent by the pro-cli usage-limit watch (scripts/pro-cli-limit-watch.ts).",
+    `Sent by the pro-cli usage-limit watch (scripts/pro-cli-limit-watch.ts) as ${origin}.`,
     "",
   ].join("\n");
 }

@@ -286,7 +286,7 @@ bun scripts/pro-cli-limit-watch.ts --dry-run   # shows what it would do, without
 ```
 
 The config fields:
-- `mail.to`, `mail.from` and `mail.command` set up email.
+- `mail.to`, `mail.from` and `mail.command` set up email. Every mail's subject starts with `[user@hostname]` of the machine that sent it, read at send time; the health check's mails do the same.
 - `ntfy.url` and `ntfy.title` set up ntfy.
 - `gateKeys` lists SSH gate keys whose failed jobs the "lifted" email counts.
 - `probeEveryMinutes` sets the probe interval (0 turns probing off); `probePrompt` sets the probe text.

@@ -22,7 +22,7 @@ import { dirname, join } from "node:path";
 import { evaluateInCdpPage } from "../src/cdp";
 import { resolvePaths } from "../src/config";
 import { PAGE_SESSION_TOKEN_EXPRESSION, toSessionTokenExport, type SessionTokenExport } from "../src/session-token";
-import { loadConfig, type LimitWatchConfig } from "./pro-cli-limit-watch";
+import { loadConfig, mailOrigin, type LimitWatchConfig } from "./pro-cli-limit-watch";
 
 export interface HealthPaths {
   db: string;
@@ -265,10 +265,11 @@ function utc(at: string): string {
 }
 
 function mailMessage(subject: string, lines: string[], config: LimitWatchConfig): string {
+  const origin = mailOrigin();
   return [
     `To: ${config.mail.to}`,
     ...(config.mail.from ? [`From: ${config.mail.from}`] : []),
-    `Subject: ${subject}`,
+    `Subject: [${origin}] ${subject}`,
     `Date: ${new Date().toUTCString()}`,
     "MIME-Version: 1.0",
     "Content-Type: text/plain; charset=utf-8",
@@ -276,7 +277,7 @@ function mailMessage(subject: string, lines: string[], config: LimitWatchConfig)
     "",
     ...lines,
     "",
-    "Sent by the pro-cli health check (scripts/pro-cli-health-check.ts).",
+    `Sent by the pro-cli health check (scripts/pro-cli-health-check.ts) as ${origin}.`,
     "",
   ].join("\n");
 }
