@@ -13,6 +13,7 @@ import {
 } from "./jobs";
 import { KEPT_CONVERSATION_CHECK_MS } from "./kept-conversations";
 import {
+  isAnswerTaskId,
   runChatGptJob,
   runChatGptResearchTask,
   type ResearchTask,
@@ -41,6 +42,8 @@ export async function executeClaimedJob(
     options.researchLeaseMs === undefined ? null : new Date(Date.now() + options.researchLeaseMs).toISOString();
   const runJob = transports.runJob ?? runChatGptJob;
   const runResearchTask = transports.runResearchTask ?? runChatGptResearchTask;
+  // Set when this run resumes a task (Deep Research, an image, or an answer read from its chat).
+  let existingTask: ResearchTaskRecord | null = null;
   try {
     const transportOptions: TransportOptions = {
       sessionTokenPath: paths.sessionTokenPath,
@@ -52,6 +55,7 @@ export async function executeClaimedJob(
       diagnosticsDir: join(paths.home, "diagnostics"),
       keepImageConversation:
         job.options.keepConversation === true || typeof job.options.conversationId === "string",
+      citations: job.options.citations,
       onLimits: (entries) => observations.push(...entries),
       onResearchTask: (task) => {
         store.upsertResearchTask(job.id, task, leaseUntil());
@@ -66,18 +70,20 @@ export async function executeClaimedJob(
         );
       },
     };
-    const existingTask = store.getResearchTask(job.id);
+    existingTask = store.getResearchTask(job.id);
     const result = existingTask
       ? await runResearchTask(researchTaskForTransport(existingTask), transportOptions)
       : await runJob(job, transportOptions);
     if (observations.length > 0) store.recordLimits(observations, job.id);
     const completed = store.markSucceeded(job.id, result);
+    if (existingTask) keepAnsweredChat(store, job, existingTask, "unverified");
     return { job: redactJob(completed), result };
   } catch (error) {
     const proError = toProError(error);
     // A refused job carries the usage counters that explain it.
     if (observations.length > 0) store.recordLimits(observations, job.id);
-    if (store.getResearchTask(job.id) && shouldDeferResearchTaskError(proError)) {
+    const task = store.getResearchTask(job.id);
+    if (task && shouldDeferResearchTaskError(proError)) {
       store.deferResearchTask(job.id, proError, researchTaskRetryDelayMs(proError));
       return {
         job: redactJob(store.get(job.id)),
@@ -85,11 +91,24 @@ export async function executeClaimedJob(
         deferred: true,
       };
     }
+    const failed = store.markFailed(job.id, proError);
+    if (existingTask) keepAnsweredChat(store, job, existingTask, "failed");
     return {
-      job: redactJob(store.markFailed(job.id, proError)),
+      job: redactJob(failed),
       error: proError.toPayload(),
     };
   }
+}
+
+// A --delete-conversation job whose answer an answer task read back never reached the transport's
+// own deletion, so its chat goes to the kept-chat sweep, which deletes it once the answer is
+// stored, or after the kept-chat maximum age when none turns up.
+function keepAnsweredChat(store: JobStore, job: JobRecord, task: ResearchTaskRecord, reason: "failed" | "unverified"): void {
+  if (!isAnswerTaskId(task.taskId) || job.options.deleteConversation !== true || !task.conversationId) return;
+  store.keepConversation(
+    { jobId: job.id, conversationId: task.conversationId, reason, cdpBase: stringFromOption(job.options.cdpBase) ?? null },
+    KEPT_CONVERSATION_CHECK_MS,
+  );
 }
 
 function researchTaskForTransport(task: ResearchTaskRecord): ResearchTask {
@@ -144,6 +163,7 @@ export async function executeEphemeralJob(
       diagnosticsDir: join(paths.home, "diagnostics"),
       keepImageConversation:
         job.options.keepConversation === true || typeof job.options.conversationId === "string",
+      citations: job.options.citations,
       onLimits: (entries) => observations.push(...entries),
       onKeptConversation: (kept) =>
         persistKeptConversation(paths.dbPath, {

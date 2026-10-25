@@ -334,6 +334,61 @@ describe("executeClaimedJob research task durability", () => {
   });
 });
 
+describe("executeClaimedJob answer tasks", () => {
+  const answerTask = (jobId: string, conversationId: string) => ({ taskId: `answer:${jobId}:${Date.now()}`, title: "Answer", conversationId });
+
+  test("a job whose stream is lost after its chat was named waits for the answer instead of failing or resending", async () => {
+    await withStore(async (store) => {
+      const created = store.create({ prompt: "question", model: "gpt-6-pro", reasoning: "standard", options: { citations: "numbered" } });
+      const claimed = store.claimQueued(created.id);
+      if (!claimed) throw new Error("Expected claimed job.");
+
+      const lost = await executeClaimedJob(store, claimed, testPaths(), {
+        runJob: async (job, options) => {
+          await options.onResearchTask?.(answerTask(job.id, "conv_lost"));
+          throw new ProError("NETWORK_ERROR", "Chrome went away");
+        },
+      });
+      expect(lost.deferred).toBe(true);
+      expect(store.get(created.id).status).toBe("running");
+
+      const resumed = await executeClaimedJob(store, store.get(created.id), testPaths(), {
+        runJob: async () => {
+          throw new Error("The prompt must not be sent again.");
+        },
+        runResearchTask: async (task, options) => {
+          expect(task.conversationId).toBe("conv_lost");
+          expect(options.citations).toBe("numbered");
+          return "the answer";
+        },
+      });
+      expect(resumed.result).toBe("the answer");
+      expect(store.get(created.id).status).toBe("succeeded");
+      expect(store.keptConversations()).toEqual([]);
+    });
+  });
+
+  test("a --delete-conversation job's chat goes to the kept-chat sweep once its answer task ends", async () => {
+    await withStore(async (store) => {
+      for (const [outcome, reason] of [["answer", "unverified"], ["no answer", "failed"]] as const) {
+        const created = store.create({ prompt: "question", model: "gpt-6-pro", reasoning: "standard", options: { deleteConversation: true } });
+        store.markRunning(created.id);
+        store.upsertResearchTask(created.id, answerTask(created.id, `conv_${reason}`));
+
+        await executeClaimedJob(store, store.get(created.id), testPaths(), {
+          runResearchTask: async () => {
+            if (outcome === "no answer") throw new ProError("ANSWER_NOT_RECOVERED", "no answer");
+            return "the answer";
+          },
+        });
+
+        expect(store.get(created.id).status).toBe(outcome === "answer" ? "succeeded" : "failed");
+        expect(store.keptConversations().find((kept) => kept.jobId === created.id)).toMatchObject({ conversationId: `conv_${reason}`, reason });
+      }
+    });
+  });
+});
+
 describe("waitTimeoutError", () => {
   test("includes job, status, elapsedMs, timeoutMs, pollMs in details", () => {
     const error = waitTimeoutError({

@@ -5,8 +5,10 @@ import {
   conversationReadPauseMs,
   DEFAULT_CDP_BASE,
   deleteSavedConversation,
+  formatAnswerCitations,
   pauseConversationReads,
   readStoredAnswer,
+  storedSources,
   type ConversationAnswerFetchResult,
   type PageEvaluator,
 } from "./transport";
@@ -58,6 +60,18 @@ async function settleKeptConversation(
     const waitMs = Math.max(context.checkMs, conversationReadPauseMs(context.evaluate, cdpBase));
     store.rescheduleKeptConversation(kept.conversationId, new Date(context.now() + waitMs).toISOString());
   };
+  let job: ReturnType<JobStore["get"]> | null = null;
+  try {
+    job = store.get(kept.jobId);
+  } catch {
+    // the job is gone; its chat is still settled
+  }
+  // A job still running reads its answer from this chat itself (an answer task); deleting the chat
+  // now would lose it.
+  if (job?.status === "running" && !expired) {
+    lookAgain();
+    return;
+  }
 
   let answer: ConversationAnswerFetchResult | null = null;
   if (conversationReadPauseMs(context.evaluate, cdpBase) === 0) {
@@ -70,7 +84,11 @@ async function settleKeptConversation(
   if (answer && !answer.ok && answer.status === 429) {
     pauseConversationReads(context.evaluate, cdpBase, answer.retryAfterMs ?? context.checkMs);
   }
-  const found = answer?.ok === true && answer.state === "done" && answer.text ? answer.text : null;
+  const stored = answer?.ok === true && answer.state === "done" && answer.text ? answer.text : null;
+  // The job's answer had its citations formatted; the stored copy gets the same before comparing.
+  const found = stored === null
+    ? null
+    : await formatAnswerCitations(kept.jobId, job?.options.citations, stored, () => storedSources(answer?.sources), context.diagnosticsDir);
   const noAnswer = answer?.ok === true && (answer.state === "empty" || answer.state === "incomplete");
   if (found) {
     if (store.recordRecoveredAnswer(kept.jobId, found, kept.reason)) {

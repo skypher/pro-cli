@@ -192,6 +192,36 @@ describe("kept chats", () => {
     });
   });
 
+  test("leaves the chat of a job that is still running alone: its answer task reads the answer from it", async () => {
+    await withStore(async (store) => {
+      const { id } = store.create({ prompt: "question", model: "gpt-6-pro", reasoning: "standard", options: {} });
+      store.markRunning(id);
+      keep(store, id, "failed");
+      const browser = fakeBrowser([done("The answer.")]);
+
+      await sweepKeptConversations(store, { evaluate: browser.evaluate });
+
+      expect(browser.calls).toEqual([]);
+      expect(store.keptConversations()).toHaveLength(1);
+    });
+  });
+
+  test("formats a recovered answer's citations as its job asked", async () => {
+    await withStore(async (store, dir) => {
+      const { id } = store.create({ prompt: "question", model: "gpt-6-pro", reasoning: "standard", options: { citations: "numbered" } });
+      store.markRunning(id);
+      store.markFailed(id, new ProError("STREAM_INCOMPLETE", "cut off"));
+      keep(store, id, "failed");
+      const cite = String.fromCharCode(0xe200) + "cite" + String.fromCharCode(0xe202) + "turn0search0" + String.fromCharCode(0xe201);
+      const sources = { search_result_groups: [{ entries: [{ url: "https://a.example/one", title: "One", ref_id: { turn_index: 0, ref_type: "search", ref_index: 0 } }] }] };
+      const browser = fakeBrowser([{ ...done(`The answer. ${cite}`), sources }]);
+
+      await sweepKeptConversations(store, { evaluate: browser.evaluate, diagnosticsDir: dir });
+
+      expect(store.get(id).result).toBe("The answer. [1]\n\nSources:\n[1] One — https://a.example/one\n");
+    });
+  });
+
   test("leaves chats alone until they are due", async () => {
     await withStore(async (store) => {
       store.keepConversation({ conversationId: "conv_later", jobId: finishedJob(store, "failed"), reason: "failed" }, 60_000);

@@ -2021,11 +2021,12 @@ describe("ChatGPT transport: cut-off answer streams", () => {
 
       await runChatGptJob(job(), { sessionTokenPath, pageEvaluator });
       expect(evaluateTimeoutMs).toBe(30 * 60_000);
-      expect(expression.endsWith(', "acct_test", 1680000)')).toBe(true);
+      // The last argument is the key the page publishes the chat id under.
+      expect(expression).toMatch(/, "acct_test", 1680000, "[0-9a-f]{8}-[0-9a-f-]{27}"\)$/);
 
       await runChatGptJob(job(), { sessionTokenPath, pageEvaluator, timeoutMs: 60_000 });
       expect(evaluateTimeoutMs).toBe(60_000);
-      expect(expression.endsWith(', "acct_test", 48000)')).toBe(true);
+      expect(expression).toMatch(/, "acct_test", 48000, "[0-9a-f]{8}-[0-9a-f-]{27}"\)$/);
     });
   });
 });
@@ -2665,3 +2666,87 @@ function requestBodyFromExpression(expression: string): Record<string, unknown> 
   expect(bodyEnd).toBeGreaterThan(bodyStart);
   return JSON.parse(expression.slice(bodyStart, bodyEnd)) as Record<string, unknown>;
 }
+
+describe("answer tasks", () => {
+  const conversationId = "6ad75a47-4840-83ec-bbaa-e2e703f57bb1";
+  const marker = (...fields: string[]) => String.fromCharCode(0xe200) + fields.join(String.fromCharCode(0xe202)) + String.fromCharCode(0xe201);
+
+  test("a chat model's job becomes an answer task once the page names the chat, so a lost browser loses no answer", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      for (const [model, expected] of [["gpt-5-5-pro", 1], ["research", 0]] as const) {
+        const tasks: unknown[] = [];
+        const pageEvaluator = (async <T>(_base: string, script: string): Promise<T> => {
+          if (script.includes("__proCliConversationIds?.[")) return conversationId as T;
+          // The request runs until Chrome goes away.
+          await Bun.sleep(60);
+          throw new Error("WebSocket closed");
+        }) as PageEvaluator;
+
+        const outcome = await runChatGptJob(job({ model }), { sessionTokenPath, pageEvaluator, conversationWatchMs: 10, onResearchTask: (task) => void tasks.push(task) })
+          .then(() => null, (error: ProError) => error.code);
+
+        expect(outcome).toBe("NETWORK_ERROR");
+        expect(tasks).toHaveLength(expected);
+        if (expected) expect(tasks[0]).toEqual({ taskId: expect.stringMatching(/^answer:job_test:\d+$/), title: "Answer", conversationId });
+      }
+    });
+  });
+
+  test("a request that ends before the first look registers no answer task", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const tasks: unknown[] = [];
+      const pageEvaluator = (async <T>(_base: string, script: string): Promise<T> =>
+        (script.includes("__proCliConversationIds?.[") ? conversationId : { ok: true, status: 200, body: conversationStream("OK") }) as T) as PageEvaluator;
+
+      expect(await runChatGptJob(job(), { sessionTokenPath, pageEvaluator, conversationWatchMs: 50, onResearchTask: (task) => void tasks.push(task) })).toBe("OK");
+      await Bun.sleep(80);
+      expect(tasks).toEqual([]);
+    });
+  });
+
+  describe("resumed", () => {
+    const task = (startedAt = Date.now() - 1_000) => ({ taskId: `answer:job_lost:${startedAt}`, title: "Answer", conversationId });
+    const reads = (results: unknown[]) => {
+      let calls = 0;
+      const pageEvaluator = (async <T>(): Promise<T> => {
+        calls += 1;
+        const next = results[Math.min(calls, results.length) - 1];
+        if (next instanceof Error) throw next;
+        return next as T;
+      }) as PageEvaluator;
+      return { pageEvaluator, calls: () => calls };
+    };
+    const codeOf = (promise: Promise<unknown>) => promise.then(() => null, (error: ProError) => error.code);
+
+    test("reads the answer from the chat and formats its citations", async () => {
+      await withTokenFile(async (sessionTokenPath) => {
+        const sources = { search_result_groups: [{ entries: [
+          { url: "https://bun.com/blog/bun-v1.4.3", title: "Bun v1.4.3", ref_id: { turn_index: 0, ref_type: "search", ref_index: 0 } },
+        ] }] };
+        const browser = reads([
+          { ok: true, status: 200, state: "pending", text: null, message: "assistant text in_progress" },
+          { ok: true, status: 200, state: "done", text: `Bun 1.4.3 is out. ${marker("cite", "turn0search0")}`, message: null, sources },
+        ]);
+
+        const answer = await runChatGptResearchTask(task(), { sessionTokenPath, pageEvaluator: browser.pageEvaluator, citations: "numbered", streamRecoveryPollMs: 0 });
+
+        expect(answer).toBe("Bun 1.4.3 is out. [1]\n\nSources:\n[1] Bun v1.4.3 — https://bun.com/blog/bun-v1.4.3\n");
+        expect(browser.calls()).toBe(2);
+      });
+    });
+
+    test("waits with NETWORK_ERROR while the chat cannot be read, and ends with ANSWER_NOT_RECOVERED", async () => {
+      await withTokenFile(async (sessionTokenPath) => {
+        const options = { sessionTokenPath, streamRecoveryPollMs: 0 };
+        expect(await codeOf(runChatGptResearchTask(task(), { ...options, ...reads([new Error("CDP down")]) }))).toBe("NETWORK_ERROR");
+        const empty = reads([{ ok: true, status: 200, state: "empty", text: null, message: "assistant text finished_successfully" }]);
+        expect(await codeOf(runChatGptResearchTask(task(), { ...options, pageEvaluator: empty.pageEvaluator }))).toBe("ANSWER_NOT_RECOVERED");
+        const gone = reads([{ ok: false, status: 404, state: "pending", text: null, message: null }]);
+        expect(await codeOf(runChatGptResearchTask(task(), { ...options, pageEvaluator: gone.pageEvaluator }))).toBe("ANSWER_NOT_RECOVERED");
+        const late = reads([new Error("must not be read")]);
+        expect(await codeOf(runChatGptResearchTask(task(Date.now() - 4 * 60 * 60_000), { ...options, pageEvaluator: late.pageEvaluator }))).toBe("ANSWER_NOT_RECOVERED");
+        expect(late.calls()).toBe(0);
+      });
+    });
+  });
+});

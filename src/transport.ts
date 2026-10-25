@@ -28,6 +28,11 @@ const MAX_REQUEST_TIMEOUT_MS = 24 * 60 * 60_000;
 const DEEP_RESEARCH_CONNECTOR_ID = "connector_openai_deep_research";
 const DEEP_RESEARCH_ROUTER_MODEL = "gpt-5-5";
 const IMAGE_TASK_PREFIX = "image:";
+// answer:<jobId>:<request start in ms> names a chat model's answer to read from its chat.
+const ANSWER_TASK_PREFIX = "answer:";
+// How often a running request's chat id is read from the page.
+const CONVERSATION_WATCH_MS = 5_000;
+const CONVERSATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const DEFAULT_IMAGE_POLL_MS = 3_000;
 const DEFAULT_IMAGE_RATE_LIMIT_POLL_MS = 30_000;
 const BROWSER_STREAM_MARGIN_MS = 2 * 60_000;
@@ -86,6 +91,10 @@ export interface TransportOptions {
    */
   onKeptConversation?: (kept: { conversationId: string; reason: KeptConversationReason }) => void | Promise<void>;
   keepImageConversation?: boolean;
+  /** How often a running request's chat id is read from the page, in ms; 0 turns it off. */
+  conversationWatchMs?: number;
+  /** The job's citations option, for an answer a resumed answer task reads from the chat. */
+  citations?: unknown;
 }
 
 export interface ResearchTask {
@@ -145,6 +154,7 @@ export async function runChatGptResearchTask(task: ResearchTask, options: Transp
     try {
       const evaluate = options.pageEvaluator ?? evaluateInCdpPage;
       const cdpBase = options.cdpBase ?? DEFAULT_CDP_BASE;
+      if (isAnswerTaskId(task.taskId)) return await waitForAnswerTask(task, evaluate, cdpBase, timeoutMs, options);
       if (isImageTask(task)) {
         const conversationId = imageConversationIdFromTask(task);
         if (!conversationId) {
@@ -250,20 +260,34 @@ async function postChatGptJob(
       ? await fetchExistingImageFileIds(continuedImageConversationId, evaluate, cdpBase)
       : new Set<string>();
     for (const attachment of attachments) baselineImageFileIds.add(attachment.fileId);
-    let browserResult = await evaluate<BrowserFetchResult>(
-      cdpBase,
-      buildBrowserFetchExpression(buildRequestBody(job, attachments), session.accountId, streamBudgetMs),
-      browserTimeoutMs,
-    );
-    if (!options.pageEvaluator && shouldRecoverCookieBloat(browserResult)) {
-      const recovered = await recoverCookieBloatInCdp(cdpBase, chatGptOrigins(), timeoutMs || 10_000).catch(() => null);
-      if (recovered?.deleted) {
-        browserResult = await evaluate<BrowserFetchResult>(
+    // Once the stream names the chat, a chat model's job becomes an answer task. If the browser or
+    // the daemon then goes away mid-answer, the daemon reads the answer from the chat afterwards,
+    // also after a restart, instead of failing the job; the prompt is never sent again.
+    let answerTaskRegistered = false;
+    const registerAnswerTask = async (conversationId: string | null): Promise<void> => {
+      const kind = canonicalModelId(job.model);
+      if (!conversationId || answerTaskRegistered || kind === "image" || kind === "research") return;
+      answerTaskRegistered = true;
+      await options.onResearchTask?.({ taskId: answerTaskId(job.id, requestStartedAt), title: "Answer", conversationId });
+    };
+    const watchMs = integerOption(options.conversationWatchMs, CONVERSATION_WATCH_MS, 0, 600_000) ?? CONVERSATION_WATCH_MS;
+    const streamChat = async (): Promise<BrowserFetchResult> => {
+      const watchKey = randomUUID();
+      const watcher = watchConversationId(watchKey, evaluate, cdpBase, watchMs, registerAnswerTask);
+      try {
+        return await evaluate<BrowserFetchResult>(
           cdpBase,
-          buildBrowserFetchExpression(buildRequestBody(job, attachments), session.accountId, streamBudgetMs),
+          buildBrowserFetchExpression(buildRequestBody(job, attachments), session.accountId, streamBudgetMs, watchKey),
           browserTimeoutMs,
         );
+      } finally {
+        watcher.stop();
       }
+    };
+    let browserResult = await streamChat();
+    if (!options.pageEvaluator && shouldRecoverCookieBloat(browserResult)) {
+      const recovered = await recoverCookieBloatInCdp(cdpBase, chatGptOrigins(), timeoutMs || 10_000).catch(() => null);
+      if (recovered?.deleted) browserResult = await streamChat();
     }
 
     if (browserResult.code === "CHATGPT_PAGE_MISSING") {
@@ -363,6 +387,7 @@ async function postChatGptJob(
         if (!(error instanceof ProError) || !isRecoverableStreamError(error) || model === "image" || model === "research") {
           throw error;
         }
+        await registerAnswerTask(summarizeConversationStream(browserResult.body).conversationId);
         const recovered = await recoverConversationAnswer(job, error, browserResult.body, {
           evaluate,
           cdpBase,
@@ -371,7 +396,10 @@ async function postChatGptJob(
           options,
         });
         keepReason = null;
-        return await formatAnswerCitations(job, recovered, () => decodeDeltaStream(browserResult.body, parseSseFrame).messages(), options);
+        return await formatAnswerCitations(job.id, job.options.citations, recovered.text, () => [
+          ...decodeDeltaStream(browserResult.body, parseSseFrame).messages(),
+          ...storedSources(recovered.sources),
+        ], options.diagnosticsDir);
       }
       if (model === "image") {
         if (parsed.text.toLowerCase().includes("image generation isn") && parsed.text.toLowerCase().includes("temporary chat")) {
@@ -429,6 +457,7 @@ async function postChatGptJob(
         }
       }
       if (deleteAfter && parsed.conversationId) {
+        await registerAnswerTask(parsed.conversationId);
         const answer = await preferStoredAnswer(job, parsed.text, parsed.conversationId, browserResult.body, {
           evaluate,
           cdpBase,
@@ -437,11 +466,14 @@ async function postChatGptJob(
           options,
         });
         keepReason = answer.verified ? null : "unverified";
-        return await formatAnswerCitations(job, answer.text, () => parsed.messages, options);
+        return await formatAnswerCitations(job.id, job.options.citations, answer.text, () => [
+          ...parsed.messages,
+          ...storedSources(answer.sources),
+        ], options.diagnosticsDir);
       }
       validateCompletedResult(job, parsed.text);
       keepReason = null;
-      return await formatAnswerCitations(job, parsed.text, () => parsed.messages, options);
+      return await formatAnswerCitations(job.id, job.options.citations, parsed.text, () => parsed.messages, options.diagnosticsDir);
     } finally {
       if (deleteAfter) await settleJobConversation(job, browserResult.body, keepReason, evaluate, cdpBase, options);
     }
@@ -466,12 +498,14 @@ function buildBrowserFetchExpression(
   requestBody: Record<string, unknown>,
   accountId: string,
   streamBudgetMs: number,
+  watchKey = "",
 ): string {
   return `(${async function browserFetch(
     endpoint: string,
     body: Record<string, unknown>,
     account: string,
     streamBudget: number,
+    conversationKey: string,
   ): Promise<BrowserFetchResult> {
     const streamDeadline = Date.now() + streamBudget;
     if (location.origin !== "https://chatgpt.com") {
@@ -546,7 +580,22 @@ function buildBrowserFetchExpression(
       const resumedText = await resumeHandoffStream(text, accessToken, turnTraceId, referrer);
       if (resumedText) text = `${text}\n\n${resumedText}`;
     }
+    if (conversationKey) delete conversationIds()[conversationKey];
     return { ok: response.ok, status: response.status, body: text };
+
+    // pro-cli reads a request's chat id from here while the stream runs (watchConversationId).
+    function conversationIds(): Record<string, string> {
+      const page = globalThis as { __proCliConversationIds?: Record<string, string> };
+      page.__proCliConversationIds ??= {};
+      return page.__proCliConversationIds;
+    }
+
+    function publishConversationId(streamText: string, from: number): void {
+      if (!conversationKey || conversationIds()[conversationKey]) return;
+      const match = /"conversation_id"\s*:\s*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"/
+        .exec(streamText.slice(Math.max(0, from - 120)));
+      if (match) conversationIds()[conversationKey] = match[1];
+    }
 
     function appHeaders(
       routeName: string,
@@ -677,7 +726,9 @@ function buildBrowserFetchExpression(
             break;
           }
           if (chunk.done) break;
+          const from = streamText.length;
           streamText += decoder.decode(chunk.value, { stream: true });
+          publishConversationId(streamText, from);
         }
         return streamText + decoder.decode();
       } catch (error) {
@@ -1179,7 +1230,7 @@ function buildBrowserFetchExpression(
       hash ^= hash >>> 16;
       return (hash >>> 0).toString(16).padStart(8, "0");
     }
-  }})(${JSON.stringify(CHATGPT_CONVERSATION_ENDPOINT)}, ${JSON.stringify(requestBody)}, ${JSON.stringify(accountId)}, ${JSON.stringify(streamBudgetMs)})`;
+  }})(${JSON.stringify(CHATGPT_CONVERSATION_ENDPOINT)}, ${JSON.stringify(requestBody)}, ${JSON.stringify(accountId)}, ${JSON.stringify(streamBudgetMs)}, ${JSON.stringify(watchKey)})`;
 }
 
 interface PreparedChatRequirements {
@@ -1676,13 +1727,14 @@ export async function readStoredAnswer(
 
 // Turns ChatGPT's citation markers into [n] references and a Sources list, or removes them,
 // as the job's citations option says (see src/citations.ts). citations.jsonl gets counts only.
-async function formatAnswerCitations(
-  job: JobRecord,
+export async function formatAnswerCitations(
+  jobId: string,
+  citations: unknown,
   text: string,
   messages: () => DecodedMessage[],
-  options: TransportOptions,
+  diagnosticsDir: string | undefined,
 ): Promise<string> {
-  const mode = citationMode(job.options.citations);
+  const mode = citationMode(citations);
   if (mode === "raw" || !hasCitationSyntax(text)) return text;
   let formatted: ReturnType<typeof formatCitations>;
   try {
@@ -1690,15 +1742,20 @@ async function formatAnswerCitations(
   } catch {
     return text;
   }
-  await logCitations(options.diagnosticsDir, job, { mode, ...formatted.stats });
+  await logCitations(diagnosticsDir, jobId, { mode, ...formatted.stats });
   return formatted.text;
 }
 
-async function logCitations(dir: string | undefined, job: JobRecord, record: Record<string, unknown>): Promise<void> {
+/** The citation data of an answer read from its chat, shaped like a streamed message for formatCitations. */
+export function storedSources(sources: Record<string, unknown> | null | undefined): DecodedMessage[] {
+  return sources ? [{ root: { message: { metadata: sources } }, touched: 0 }] : [];
+}
+
+async function logCitations(dir: string | undefined, jobId: string, record: Record<string, unknown>): Promise<void> {
   if (!dir) return;
   try {
     await mkdir(dir, { recursive: true, mode: 0o700 });
-    const line = { jobId: job.id, recordedAt: new Date().toISOString(), ...record };
+    const line = { jobId, recordedAt: new Date().toISOString(), ...record };
     await appendFile(join(dir, "citations.jsonl"), `${JSON.stringify(line)}\n`, { mode: 0o600 });
   } catch {
     // best effort; the job result matters more than this record
@@ -1755,6 +1812,8 @@ export interface ConversationAnswerFetchResult {
   text: string | null;
   message: string | null;
   retryAfterMs?: number | null;
+  /** The answer's citation data (content_references, search_result_groups) when it is done. */
+  sources?: Record<string, unknown> | null;
 }
 
 interface ConversationAnswerRecovery {
@@ -1780,7 +1839,7 @@ async function recoverConversationAnswer(
     timeoutMs: number;
     options: TransportOptions;
   },
-): Promise<string> {
+): Promise<{ text: string; sources: Record<string, unknown> | null }> {
   const stream = summarizeConversationStream(rawStream);
   const diagnosticsPath = await writeStreamDiagnostics(context.options.diagnosticsDir, job, streamError.code, stream);
   let recovery: ConversationAnswerRecovery | null = null;
@@ -1794,7 +1853,7 @@ async function recoverConversationAnswer(
     });
     if (result.text !== null) {
       validateCompletedResult(job, result.text);
-      return result.text;
+      return { text: result.text, sources: result.sources ?? null };
     }
     recovery = result.recovery;
   }
@@ -1836,7 +1895,7 @@ async function preferStoredAnswer(
     timeoutMs: number;
     options: TransportOptions;
   },
-): Promise<{ text: string; verified: boolean }> {
+): Promise<{ text: string; verified: boolean; sources: Record<string, unknown> | null }> {
   const answerWaitMs = context.timeoutMs > 0 ? context.timeoutMs : DEFAULT_ANSWER_WAIT_MS;
   const stored = await pollConversationAnswer(conversationId, context.evaluate, context.cdpBase, {
     notBefore: context.requestStartedAt - 60_000,
@@ -1854,7 +1913,7 @@ async function preferStoredAnswer(
   }
   if (stored.text === null || stored.text === streamedText) {
     validateCompletedResult(job, streamedText);
-    return { text: streamedText, verified: stored.text !== null };
+    return { text: streamedText, verified: stored.text !== null, sources: stored.sources ?? null };
   }
   await writeStreamDiagnostics(context.options.diagnosticsDir, job, "STREAM_ANSWER_MISMATCH", {
     ...summarizeConversationStream(rawStream),
@@ -1864,7 +1923,7 @@ async function preferStoredAnswer(
     firstDifferenceAt: firstDifference(streamedText, stored.text),
   });
   validateCompletedResult(job, stored.text);
-  return { text: stored.text, verified: true };
+  return { text: stored.text, verified: true, sources: stored.sources ?? null };
 }
 
 function firstDifference(a: string, b: string): number {
@@ -1886,7 +1945,7 @@ async function pollConversationAnswer(
   evaluate: PageEvaluator,
   cdpBase: string,
   options: { notBefore: number; deadline: number; pollMs: number; transientLimitMs?: number },
-): Promise<{ text: string | null; recovery: ConversationAnswerRecovery }> {
+): Promise<{ text: string | null; recovery: ConversationAnswerRecovery; sources?: Record<string, unknown> | null }> {
   let polls = 0;
   let failures = 0;
   let transient = 0;
@@ -1928,7 +1987,7 @@ async function pollConversationAnswer(
       }
     }
     if (last && last.ok && last.state === "done" && last.text) {
-      return { text: last.text, recovery: { state: "done", status: last.status, polls } };
+      return { text: last.text, recovery: { state: "done", status: last.status, polls }, sources: last.sources ?? null };
     }
     if (last && last.ok && (last.state === "empty" || last.state === "incomplete")) {
       return { text: null, recovery: { state: last.state, status: last.status, polls, message: last.message } };
@@ -2015,7 +2074,12 @@ function buildConversationAnswerFetchExpression(conversationId: string, notBefor
       recipient?: unknown;
       channel?: unknown;
       create_time?: unknown;
-      metadata?: { is_thinking_preamble_message?: unknown; is_visually_hidden_from_conversation?: unknown };
+      metadata?: {
+        is_thinking_preamble_message?: unknown;
+        is_visually_hidden_from_conversation?: unknown;
+        content_references?: unknown;
+        search_result_groups?: unknown;
+      };
     };
     const describe = (message: StoredMessage | undefined): string | null => message
       ? [
@@ -2060,7 +2124,11 @@ function buildConversationAnswerFetchExpression(conversationId: string, notBefor
       return { ok: true, status: response.status, state: "incomplete", text: null, message: summary };
     }
     if (!text.trim()) return { ok: true, status: response.status, state: "empty", text: null, message: summary };
-    return { ok: true, status: response.status, state: "done", text, message: summary };
+    const sources = {
+      content_references: answer.metadata?.content_references ?? null,
+      search_result_groups: answer.metadata?.search_result_groups ?? null,
+    };
+    return { ok: true, status: response.status, state: "done", text, message: summary, sources };
   }})(${JSON.stringify(conversationId)}, ${JSON.stringify(notBeforeSeconds)})`;
 }
 
@@ -2553,6 +2621,99 @@ function imagePollSleepMs(timeoutMs: number, startedAt: number, status?: number)
 
 function isTransientImageStatus(status: number): boolean {
   return status === 408 || status === 429 || status >= 500;
+}
+
+function answerTaskId(jobId: string, requestStartedAt: number): string {
+  return `${ANSWER_TASK_PREFIX}${jobId}:${requestStartedAt}`;
+}
+
+export function isAnswerTaskId(taskId: string): boolean {
+  return taskId.startsWith(ANSWER_TASK_PREFIX);
+}
+
+/**
+ * Reads the chat id the page publishes for a running request (see publishConversationId in the
+ * page script) every everyMs, until it is found or stop() is called. Read errors are ignored.
+ */
+function watchConversationId(
+  key: string,
+  evaluate: PageEvaluator,
+  cdpBase: string,
+  everyMs: number,
+  onFound: (conversationId: string) => void | Promise<void>,
+): { stop: () => void } {
+  let stopped = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const check = async (): Promise<void> => {
+    if (stopped) return;
+    const id = await evaluate<unknown>(cdpBase, `globalThis.__proCliConversationIds?.[${JSON.stringify(key)}] ?? null`, 5_000)
+      .catch(() => null);
+    if (stopped) return;
+    if (typeof id === "string" && CONVERSATION_ID.test(id)) {
+      stopped = true;
+      await Promise.resolve(onFound(id)).catch(() => undefined);
+      return;
+    }
+    timer = setTimeout(() => void check(), everyMs);
+  };
+  if (everyMs > 0) timer = setTimeout(() => void check(), everyMs);
+  return {
+    stop: () => {
+      stopped = true;
+      clearTimeout(timer);
+    },
+  };
+}
+
+/**
+ * Reads the answer of a request whose stream was lost from its chat, until the answer is final
+ * or the wait that began with the request is over (--timeout, else DEFAULT_ANSWER_WAIT_MS). While
+ * the chat cannot be read (no browser, a rate limit), it fails with NETWORK_ERROR, which the daemon
+ * defers and retries; ANSWER_NOT_RECOVERED ends the job.
+ */
+async function waitForAnswerTask(
+  task: ResearchTask,
+  evaluate: PageEvaluator,
+  cdpBase: string,
+  timeoutMs: number,
+  options: TransportOptions,
+): Promise<string> {
+  const [jobId, startedAtText] = splitLast(task.taskId.slice(ANSWER_TASK_PREFIX.length), ":");
+  const startedAt = Number(startedAtText);
+  const conversationId = task.conversationId;
+  const deadline = startedAt + (timeoutMs > 0 ? timeoutMs : DEFAULT_ANSWER_WAIT_MS);
+  const notRecovered = (recovery: ConversationAnswerRecovery | null) =>
+    new ProError("ANSWER_NOT_RECOVERED", "The answer could not be read from its chat after the stream was lost.", {
+      exitCode: EXIT.upstream,
+      suggestions: [
+        "Look for the answer in ChatGPT if the chat was saved.",
+        "Send the request again only if it is still needed; it spends Pro quota again.",
+      ],
+      details: { conversationId: conversationId ?? null, recovery },
+    });
+  if (!conversationId || !Number.isFinite(startedAt) || Date.now() >= deadline) throw notRecovered(null);
+  const result = await pollConversationAnswer(conversationId, evaluate, cdpBase, {
+    notBefore: startedAt - 60_000,
+    deadline,
+    pollMs: integerOption(options.streamRecoveryPollMs, STREAM_RECOVERY_POLL_MS, 0, 60_000) ?? STREAM_RECOVERY_POLL_MS,
+  });
+  if (result.text !== null) {
+    return await formatAnswerCitations(jobId, options.citations, result.text, () => storedSources(result.sources), options.diagnosticsDir);
+  }
+  const unreadable = result.recovery.state === "error"
+    || (result.recovery.state === "unavailable" && result.recovery.status !== 404);
+  if (unreadable && Date.now() < deadline) {
+    throw new ProError("NETWORK_ERROR", "The chat holding this job's answer cannot be read yet.", {
+      exitCode: EXIT.network,
+      details: { conversationId, recovery: result.recovery },
+    });
+  }
+  throw notRecovered(result.recovery);
+}
+
+function splitLast(text: string, separator: string): [string, string] {
+  const at = text.lastIndexOf(separator);
+  return at < 0 ? [text, ""] : [text.slice(0, at), text.slice(at + separator.length)];
 }
 
 function isImageTask(task: ResearchTask): boolean {
