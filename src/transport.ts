@@ -49,9 +49,6 @@ const STORED_ANSWER_TRANSIENT_LIMIT_MS = 15 * 60_000;
 // Without --timeout, a job waits this long in total for a Pro answer; long Pro
 // runs can take well over an hour.
 const DEFAULT_ANSWER_WAIT_MS = 3 * 60 * 60_000;
-// An answer task whose chat cannot be read because the page is logged out waits past that, up
-// to this long after the request, for someone to log in again: the answer is paid for already.
-const LOGGED_OUT_ANSWER_WAIT_MS = 7 * 24 * 60 * 60_000;
 
 export type PageEvaluator = <T>(cdpBase: string, expression: string, timeoutMs?: number) => Promise<T>;
 
@@ -2681,9 +2678,9 @@ function watchConversationId(
  * Reads the answer of a request whose stream was lost from its chat, until the answer is final
  * or the wait that began with the request is over (--timeout, else DEFAULT_ANSWER_WAIT_MS). While
  * the chat cannot be read (no browser, a rate limit), it fails with NETWORK_ERROR, which the daemon
- * defers and retries; ANSWER_NOT_RECOVERED ends the job. While the page is logged out it fails with
- * CHATGPT_PAGE_LOGGED_OUT, also deferred, up to LOGGED_OUT_ANSWER_WAIT_MS after the request. So
- * past the wait the chat is still read once, and an answer that is final by then is taken.
+ * defers and retries, and while the page is logged out with CHATGPT_PAGE_LOGGED_OUT, also deferred.
+ * Once the wait is over, the chat is read once more: an answer that is final by then is taken,
+ * otherwise ANSWER_NOT_RECOVERED ends the job.
  */
 async function waitForAnswerTask(
   task: ResearchTask,
@@ -2705,9 +2702,7 @@ async function waitForAnswerTask(
       ],
       details: { conversationId: conversationId ?? null, recovery },
     });
-  if (!conversationId || !Number.isFinite(startedAt) || Date.now() >= startedAt + LOGGED_OUT_ANSWER_WAIT_MS) {
-    throw notRecovered(null);
-  }
+  if (!conversationId || !Number.isFinite(startedAt)) throw notRecovered(null);
   const result = await pollConversationAnswer(conversationId, evaluate, cdpBase, {
     notBefore: startedAt - 60_000,
     deadline,
@@ -2716,7 +2711,7 @@ async function waitForAnswerTask(
   if (result.text !== null) {
     return await formatAnswerCitations(jobId, options.citations, result.text, () => storedSources(result.sources), options.diagnosticsDir);
   }
-  if (result.recovery.state === "logged_out") {
+  if (result.recovery.state === "logged_out" && Date.now() < deadline) {
     throw new ProError("CHATGPT_PAGE_LOGGED_OUT", "The ChatGPT page is logged out, so the chat holding this job's answer cannot be read.", {
       exitCode: EXIT.auth,
       suggestions: [

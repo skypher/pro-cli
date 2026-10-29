@@ -2771,21 +2771,18 @@ describe("answer tasks", () => {
         const late = reads([{ ok: true, status: 200, state: "pending", text: null, message: "assistant thoughts in_progress" }]);
         expect(await codeOf(runChatGptResearchTask(task(Date.now() - 4 * 60 * 60_000), { ...options, pageEvaluator: late.pageEvaluator }))).toBe("ANSWER_NOT_RECOVERED");
         expect(late.calls()).toBe(1);
-        const expired = reads([new Error("must not be read")]);
-        expect(await codeOf(runChatGptResearchTask(task(Date.now() - 8 * 24 * 60 * 60_000), { ...options, pageEvaluator: expired.pageEvaluator }))).toBe("ANSWER_NOT_RECOVERED");
-        expect(expired.calls()).toBe(0);
       });
     });
 
-    test("waits while the page is logged out instead of taking its 404 for a gone chat, also past the request's wait", async () => {
+    test("waits while the page is logged out instead of taking its 404 for a gone chat, until the request's wait is over", async () => {
       await withTokenFile(async (sessionTokenPath) => {
         const options = { sessionTokenPath, streamRecoveryPollMs: 0 };
         const notFound = { status: 404, body: { detail: "Conversation not found" } };
-        for (const startedAt of [Date.now() - 1_000, Date.now() - 4 * 60 * 60_000]) {
+        for (const [startedAt, code] of [[Date.now() - 1_000, "CHATGPT_PAGE_LOGGED_OUT"], [Date.now() - 4 * 60 * 60_000, "ANSWER_NOT_RECOVERED"]] as const) {
           const loggedOut = chatReadingPage({}, notFound);
           const error = await runChatGptResearchTask(task(startedAt), { ...options, pageEvaluator: loggedOut.pageEvaluator })
             .then(() => null, (thrown: ProError) => thrown);
-          expect(error?.code).toBe("CHATGPT_PAGE_LOGGED_OUT");
+          expect(error?.code).toBe(code);
           expect(error?.details).toMatchObject({ conversationId, recovery: { state: "logged_out", status: 404, polls: 1 } });
           expect(loggedOut.reads()).toBe(1);
         }
