@@ -704,6 +704,15 @@ export async function runGate(cfg: GateConfig, commandLine: string | undefined, 
   return code;
 }
 
+/**
+ * Writes to the gate's stdout or stderr and resolves once the chunk is out; a hung-up client
+ * rejects with EPIPE. Not Bun.write: once process.stdout exists, Bun 1.4.4's Bun.write sent the
+ * first 64 KiB of a 64-270 KiB output twice.
+ */
+export function writeStream(stream: NodeJS.WriteStream, chunk: Uint8Array | string): Promise<void> {
+  return new Promise((resolve, reject) => stream.write(chunk, (error) => (error ? reject(error) : resolve())));
+}
+
 function clientGoneError(): GateError {
   return new GateError("CLIENT_GONE", "The SSH client went away before the output could be written.", 7);
 }
@@ -752,18 +761,16 @@ if (import.meta.main) {
     maxInboxFiles: 200,
     jobsDb: join(home, ".pro-cli", "jobs.sqlite"),
   };
-  // process.exit drops output still queued for a pipe, so stderr goes out through Bun.write too.
+  // process.exit drops output still queued for a pipe, so stderr writes are awaited too.
   let stderrWritten: Promise<unknown> = Promise.resolve();
   const code = await runGate(
     cfg,
     process.env.SSH_ORIGINAL_COMMAND,
     {
       stdin: Bun.stdin.stream() as unknown as AsyncIterable<Uint8Array>,
-      stdout: async (chunk) => {
-        await Bun.write(Bun.stdout, chunk);
-      },
+      stdout: (chunk) => writeStream(process.stdout, chunk),
       stderr: (chunk) => {
-        stderrWritten = stderrWritten.then(() => Bun.write(Bun.stderr, chunk)).catch(() => undefined);
+        stderrWritten = stderrWritten.then(() => writeStream(process.stderr, chunk)).catch(() => undefined);
       },
       clientGone: watchClient(),
     },

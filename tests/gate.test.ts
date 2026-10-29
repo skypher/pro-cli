@@ -680,3 +680,37 @@ describe("client gone", () => {
     expect(JSON.stringify(entry)).not.toContain("no space");
   });
 });
+
+describe("gate output", () => {
+  const gate = join(import.meta.dir, "..", "scripts", "pro-cli-gate.ts");
+  // A script against the gate's writeStream. Its child runs with stdout on a pipe, as under sshd
+  // (Bun.spawn alone would give it a socket).
+  const script = (body: string) =>
+    `import { writeStream } from ${JSON.stringify(gate)};\nprocess.stdout.on("error", () => undefined);\n${body}`;
+
+  test("a reader slower than the gate gets a 150 KB answer once, not its first 64 KiB twice", async () => {
+    const body = `await writeStream(process.stdout, "word ".repeat(30_000));\nprocess.exit(0);`;
+    // The reader starts late: the gate has filled the pipe by then.
+    const child = Bun.spawn(["sh", "-c", '"$0" -e "$1" | { sleep 0.5; cat; }', process.execPath, script(body)], {
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    expect(stderr).toBe("");
+    expect(stdout).toBe("word ".repeat(30_000));
+  });
+
+  test("a write to a client that hung up fails with EPIPE, which the gate records as CLIENT_GONE", async () => {
+    const body = `const error = await writeStream(process.stdout, "word ".repeat(400_000)).then(() => null, (e) => e);
+process.stderr.write(String(error?.code), () => process.exit(0));`;
+    const child = Bun.spawn(["sh", "-c", '"$0" -e "$1" | head -c 5 > /dev/null', process.execPath, script(body)], {
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "pipe",
+    });
+    const [stderr, code] = await Promise.all([new Response(child.stderr).text(), child.exited]);
+    expect(code).toBe(0);
+    expect(stderr).toBe("EPIPE");
+  });
+});
