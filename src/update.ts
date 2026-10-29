@@ -3,12 +3,8 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { EXIT, ProError } from "./errors";
 
-const REPO_URL = "https://github.com/ratacat/pro-cli.git";
-const ALLOWED_ORIGINS = new Set([
-  REPO_URL,
-  "https://github.com/ratacat/pro-cli",
-  "git@github.com:ratacat/pro-cli.git",
-]);
+// Upstream, and the fork that deployments of it track.
+const ALLOWED_REPOS = new Set(["github.com/ratacat/pro-cli", "github.com/skypher/pro-cli"]);
 
 export interface UpdateStep {
   command: string;
@@ -24,17 +20,20 @@ export interface UpdateResult {
 
 export interface UpdateOptions {
   repoRoot?: string;
+  /** The bun to install with; defaults to the one running pro-cli, which need not be on PATH. */
+  bun?: string;
   runCommand?: (command: string, args: string[], cwd?: string) => UpdateStep;
 }
 
 export function updateProCli(options: UpdateOptions = {}): UpdateResult {
   const repoRoot = options.repoRoot ?? resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  const bun = options.bun ?? process.execPath;
   const runCommand = options.runCommand ?? run;
   const origin = runCommand("git", ["-C", repoRoot, "remote", "get-url", "origin"]).output.trim();
-  if (!ALLOWED_ORIGINS.has(origin)) {
+  if (!ALLOWED_REPOS.has(repoKey(origin))) {
     throw new ProError("UPDATE_WRONG_ORIGIN", `Refusing to update checkout with origin ${origin}.`, {
       exitCode: EXIT.invalidArgs,
-      suggestions: [`Expected ${REPO_URL}.`],
+      suggestions: [`Expected ${[...ALLOWED_REPOS].map((repo) => `https://${repo}.git`).join(" or ")}.`],
     });
   }
 
@@ -62,13 +61,23 @@ export function updateProCli(options: UpdateOptions = {}): UpdateResult {
 
   const steps = [
     runCommand("git", ["-C", repoRoot, "pull", "--ff-only", "origin", "main"]),
-    runCommand("bun", ["install"], repoRoot),
-    runCommand("bun", ["link"], repoRoot),
+    runCommand(bun, ["install"], repoRoot),
+    runCommand(bun, ["link"], repoRoot),
     runCommand("pro-cli", ["daemon", "restart", "--json"]),
   ];
   const version = runCommand("pro-cli", ["--version"]).output.trim();
 
   return { repoRoot, branch, version, steps };
+}
+
+/** Reduce a GitHub https or ssh URL to host/owner/repo, so every spelling of one repo compares equal. */
+function repoKey(url: string): string {
+  return url
+    .replace(/^(?:https:\/\/|ssh:\/\/git@|git@)/, "")
+    .replace(/^github\.com:/, "github.com/")
+    .replace(/\/$/, "")
+    .replace(/\.git$/, "")
+    .toLowerCase();
 }
 
 function run(command: string, args: string[], cwd?: string): UpdateStep {
