@@ -49,6 +49,9 @@ const STORED_ANSWER_TRANSIENT_LIMIT_MS = 15 * 60_000;
 // Without --timeout, a job waits this long in total for a Pro answer; long Pro
 // runs can take well over an hour.
 const DEFAULT_ANSWER_WAIT_MS = 3 * 60 * 60_000;
+// An answer task whose chat cannot be read because the page is logged out waits past that, up
+// to this long after the request, for someone to log in again: the answer is paid for already.
+const LOGGED_OUT_ANSWER_WAIT_MS = 7 * 24 * 60 * 60_000;
 
 export type PageEvaluator = <T>(cdpBase: string, expression: string, timeoutMs?: number) => Promise<T>;
 
@@ -1814,10 +1817,12 @@ export interface ConversationAnswerFetchResult {
   retryAfterMs?: number | null;
   /** The answer's citation data (content_references, search_result_groups) when it is done. */
   sources?: Record<string, unknown> | null;
+  /** The page has no ChatGPT session, so the chat could not be read. */
+  loggedOut?: boolean;
 }
 
 interface ConversationAnswerRecovery {
-  state: "done" | "pending" | "empty" | "incomplete" | "unavailable" | "timeout" | "error";
+  state: "done" | "pending" | "empty" | "incomplete" | "unavailable" | "logged_out" | "timeout" | "error";
   status?: number;
   polls: number;
   transient?: number;
@@ -1992,6 +1997,10 @@ async function pollConversationAnswer(
     if (last && last.ok && (last.state === "empty" || last.state === "incomplete")) {
       return { text: null, recovery: { state: last.state, status: last.status, polls, message: last.message } };
     }
+    // Polling cannot help until someone logs in again.
+    if (fetched && !fetched.ok && fetched.loggedOut) {
+      return { text: null, recovery: { state: "logged_out", status: fetched.status, polls } };
+    }
     if (fetched && !fetched.ok && isTransientAnswerFetchStatus(fetched.status)) {
       transient += 1;
       streak += 1;
@@ -2040,6 +2049,8 @@ function buildConversationAnswerFetchExpression(conversationId: string, notBefor
     });
     const session = (await sessionResponse.json().catch(() => null)) as { accessToken?: unknown } | null;
     const accessToken = typeof session?.accessToken === "string" ? session.accessToken : "";
+    // Without a session ChatGPT answers 404 for any chat, the same as for one that is gone.
+    const loggedOut = !accessToken && (sessionResponse.ok || sessionResponse.status === 401);
     const response = await fetch(
       `https://chatgpt.com/backend-api/conversation/${encodeURIComponent(id)}`,
       {
@@ -2061,6 +2072,7 @@ function buildConversationAnswerFetchExpression(conversationId: string, notBefor
         text: null,
         message: null,
         retryAfterMs: Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : null,
+        ...(loggedOut ? { loggedOut: true } : {}),
       };
     }
     const mapping = body.mapping && typeof body.mapping === "object"
@@ -2669,7 +2681,9 @@ function watchConversationId(
  * Reads the answer of a request whose stream was lost from its chat, until the answer is final
  * or the wait that began with the request is over (--timeout, else DEFAULT_ANSWER_WAIT_MS). While
  * the chat cannot be read (no browser, a rate limit), it fails with NETWORK_ERROR, which the daemon
- * defers and retries; ANSWER_NOT_RECOVERED ends the job.
+ * defers and retries; ANSWER_NOT_RECOVERED ends the job. While the page is logged out it fails with
+ * CHATGPT_PAGE_LOGGED_OUT, also deferred, up to LOGGED_OUT_ANSWER_WAIT_MS after the request. So
+ * past the wait the chat is still read once, and an answer that is final by then is taken.
  */
 async function waitForAnswerTask(
   task: ResearchTask,
@@ -2691,7 +2705,9 @@ async function waitForAnswerTask(
       ],
       details: { conversationId: conversationId ?? null, recovery },
     });
-  if (!conversationId || !Number.isFinite(startedAt) || Date.now() >= deadline) throw notRecovered(null);
+  if (!conversationId || !Number.isFinite(startedAt) || Date.now() >= startedAt + LOGGED_OUT_ANSWER_WAIT_MS) {
+    throw notRecovered(null);
+  }
   const result = await pollConversationAnswer(conversationId, evaluate, cdpBase, {
     notBefore: startedAt - 60_000,
     deadline,
@@ -2699,6 +2715,16 @@ async function waitForAnswerTask(
   });
   if (result.text !== null) {
     return await formatAnswerCitations(jobId, options.citations, result.text, () => storedSources(result.sources), options.diagnosticsDir);
+  }
+  if (result.recovery.state === "logged_out") {
+    throw new ProError("CHATGPT_PAGE_LOGGED_OUT", "The ChatGPT page is logged out, so the chat holding this job's answer cannot be read.", {
+      exitCode: EXIT.auth,
+      suggestions: [
+        "Sign in to ChatGPT in the CDP Chrome window, then run pro-cli auth capture --json.",
+        "The job then reads its answer from the chat; it does not send the request again.",
+      ],
+      details: { conversationId, recovery: result.recovery },
+    });
   }
   const unreadable = result.recovery.state === "error"
     || (result.recovery.state === "unavailable" && result.recovery.status !== 404);

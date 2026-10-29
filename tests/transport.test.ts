@@ -2667,6 +2667,30 @@ function requestBodyFromExpression(expression: string): Record<string, unknown> 
   return JSON.parse(expression.slice(bodyStart, bodyEnd)) as Record<string, unknown>;
 }
 
+/**
+ * Runs the real in-page chat read against a fake ChatGPT: the session endpoint answers with
+ * session, and the chat with chat (ChatGPT answers 404 for a chat it shows no one). Other page
+ * scripts get other's result.
+ */
+function chatReadingPage(session: Record<string, unknown>, chat: { status: number; body: unknown }, other: unknown = null) {
+  let reads = 0;
+  const realFetch = globalThis.fetch;
+  const pageEvaluator = (async <T>(_base: string, script: string): Promise<T> => {
+    if (!script.includes("fetchConversationAnswer")) return other as T;
+    reads += 1;
+    globalThis.fetch = (async (url: string | URL | Request) =>
+      String(url).endsWith("/api/auth/session")
+        ? Response.json(session)
+        : Response.json(chat.body, { status: chat.status })) as typeof fetch;
+    try {
+      return (await (0, eval)(script)) as T;
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }) as PageEvaluator;
+  return { pageEvaluator, reads: () => reads };
+}
+
 describe("answer tasks", () => {
   const conversationId = "6ad75a47-4840-83ec-bbaa-e2e703f57bb1";
   const marker = (...fields: string[]) => String.fromCharCode(0xe200) + fields.join(String.fromCharCode(0xe202)) + String.fromCharCode(0xe201);
@@ -2743,10 +2767,66 @@ describe("answer tasks", () => {
         expect(await codeOf(runChatGptResearchTask(task(), { ...options, pageEvaluator: empty.pageEvaluator }))).toBe("ANSWER_NOT_RECOVERED");
         const gone = reads([{ ok: false, status: 404, state: "pending", text: null, message: null }]);
         expect(await codeOf(runChatGptResearchTask(task(), { ...options, pageEvaluator: gone.pageEvaluator }))).toBe("ANSWER_NOT_RECOVERED");
-        const late = reads([new Error("must not be read")]);
+        // Past the request's 3-hour wait, the chat is read once more.
+        const late = reads([{ ok: true, status: 200, state: "pending", text: null, message: "assistant thoughts in_progress" }]);
         expect(await codeOf(runChatGptResearchTask(task(Date.now() - 4 * 60 * 60_000), { ...options, pageEvaluator: late.pageEvaluator }))).toBe("ANSWER_NOT_RECOVERED");
-        expect(late.calls()).toBe(0);
+        expect(late.calls()).toBe(1);
+        const expired = reads([new Error("must not be read")]);
+        expect(await codeOf(runChatGptResearchTask(task(Date.now() - 8 * 24 * 60 * 60_000), { ...options, pageEvaluator: expired.pageEvaluator }))).toBe("ANSWER_NOT_RECOVERED");
+        expect(expired.calls()).toBe(0);
       });
+    });
+
+    test("waits while the page is logged out instead of taking its 404 for a gone chat, also past the request's wait", async () => {
+      await withTokenFile(async (sessionTokenPath) => {
+        const options = { sessionTokenPath, streamRecoveryPollMs: 0 };
+        const notFound = { status: 404, body: { detail: "Conversation not found" } };
+        for (const startedAt of [Date.now() - 1_000, Date.now() - 4 * 60 * 60_000]) {
+          const loggedOut = chatReadingPage({}, notFound);
+          const error = await runChatGptResearchTask(task(startedAt), { ...options, pageEvaluator: loggedOut.pageEvaluator })
+            .then(() => null, (thrown: ProError) => thrown);
+          expect(error?.code).toBe("CHATGPT_PAGE_LOGGED_OUT");
+          expect(error?.details).toMatchObject({ conversationId, recovery: { state: "logged_out", status: 404, polls: 1 } });
+          expect(loggedOut.reads()).toBe(1);
+        }
+        // Logged in, a 404 means the chat is gone.
+        const gone = chatReadingPage({ accessToken: "tok" }, notFound);
+        expect(await codeOf(runChatGptResearchTask(task(), { ...options, pageEvaluator: gone.pageEvaluator }))).toBe("ANSWER_NOT_RECOVERED");
+        expect(gone.reads()).toBe(3);
+      });
+    });
+
+    test("takes the answer once the page is logged in again, though the request's wait is over", async () => {
+      await withTokenFile(async (sessionTokenPath) => {
+        const startedAt = Date.now() - 6 * 60 * 60_000;
+        const asked = startedAt / 1000 + 1;
+        const page = chatReadingPage({ accessToken: "tok" }, {
+          status: 200,
+          body: {
+            current_node: "final",
+            mapping: {
+              user: { message: { author: { role: "user" }, content: { content_type: "text", parts: ["q"] }, status: "finished_successfully", create_time: asked } },
+              final: { message: { author: { role: "assistant" }, channel: "final", recipient: "all", content: { content_type: "text", parts: ["Stored answer."] }, status: "finished_successfully", end_turn: true, create_time: asked + 1800 } },
+            },
+          },
+        });
+
+        expect(await runChatGptResearchTask(task(startedAt), { sessionTokenPath, pageEvaluator: page.pageEvaluator, streamRecoveryPollMs: 0 })).toBe("Stored answer.");
+        expect(page.reads()).toBe(1);
+      });
+    });
+  });
+
+  test("a stream lost as the page logs out goes to the answer task without polling the chat's 404", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const page = chatReadingPage({}, { status: 404, body: { detail: "Conversation not found" } }, { ok: true, status: 200, body: cutOffStream("conv_out") });
+
+      const error = await runChatGptJob(job(), { sessionTokenPath, pageEvaluator: page.pageEvaluator, streamRecoveryPollMs: 0 })
+        .then(() => null, (thrown: ProError) => thrown);
+
+      expect(error?.code).toBe("STREAM_INCOMPLETE");
+      expect(error?.details).toMatchObject({ conversationId: "conv_out", recovery: { state: "logged_out", status: 404, polls: 1 } });
+      expect(page.reads()).toBe(1);
     });
   });
 });
