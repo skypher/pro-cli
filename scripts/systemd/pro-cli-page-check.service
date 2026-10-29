@@ -1,0 +1,11 @@
+# Copy to ~/.config/systemd/user/ together with the .timer and the health check's units; adjust
+# the bun and checkout paths. It shares the health check's state and log.
+[Unit]
+Description=pro-cli page check (is the ChatGPT page logged out?)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.bun/bin/bun %h/pro-cli/scripts/pro-cli-health-check.ts --page-only
+StandardOutput=append:%h/.local/state/pro-cli-health-check/check.log
+StandardError=append:%h/.local/state/pro-cli-health-check/check.log
+TimeoutStartSec=120

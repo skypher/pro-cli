@@ -9,11 +9,15 @@
 // - gate calls failed inside the gate, or for a login, Chrome, token or daemon reason;
 // - jobs failed for a reason other than a usage-limit refusal (the limit watch reports those);
 // - answers turned up later in kept chats, so a gate key should fetch those jobs again;
-// - the usage-limit watch timer is not active.
+// - the usage-limit watch timer or the page-check timer is not active.
 // A lasting problem (port down, logged out, token expiring) is announced once, and again only
 // after it cleared. Each run prints one line. It never reads prompt or answer text.
 //
-//   bun scripts/pro-cli-health-check.ts [--dry-run] [--config PATH]
+// With --page-only, run every 10 minutes, it checks only whether the ChatGPT page is logged out,
+// so a logout is announced within minutes rather than at the next twice-daily run. It shares the
+// state with those runs, which then do not announce it again, and it logs only what it sends.
+//
+//   bun scripts/pro-cli-health-check.ts [--page-only] [--dry-run] [--config PATH]
 
 import { Database } from "bun:sqlite";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
@@ -48,9 +52,17 @@ export interface HealthDeps {
   postNtfy: (body: string, headers: Record<string, string>) => Promise<boolean>;
   timers?: string[];
   dryRun?: boolean;
+  /** Check only whether the page is logged out (--page-only). */
+  pageOnly?: boolean;
 }
 
 export const TOKEN_WARNING_MS = 48 * 60 * 60_000;
+
+const PAGE_LOGGED_OUT_KEY = "page-logged-out";
+const PAGE_LOGGED_OUT: Problem = {
+  key: PAGE_LOGGED_OUT_KEY,
+  line: "The ChatGPT page is logged out: no job can run. Log in in the pro-cli Chrome, then run pro-cli auth capture --json.",
+};
 
 // Gate errors that are the client's own (a bad flag, a job not done yet) or expected states.
 const EXPECTED_GATE_ERRORS = new Set([
@@ -77,6 +89,7 @@ interface Problem {
 
 export async function runHealthCheck(config: LimitWatchConfig, paths: HealthPaths, deps: HealthDeps): Promise<void> {
   const state = await loadState(paths.state);
+  if (deps.pageOnly) return await checkPage(config, paths, deps, state);
   const now = deps.now();
   // The first run only sets the starting point for events; it still reports lasting problems.
   const since = state.lastRunAt ?? now.toISOString();
@@ -89,7 +102,7 @@ export async function runHealthCheck(config: LimitWatchConfig, paths: HealthPath
   const page = cdpUp ? await deps.pageSession().catch((): PageSession => ({ status: "unavailable" })) : null;
   if (!cdpUp) lasting.push({ key: "cdp-down", line: "Chrome's CDP port does not answer: no job can run. Start the pro-cli Chrome." });
   else if (page?.status === "logged_out") {
-    lasting.push({ key: "page-logged-out", line: "The ChatGPT page is logged out: no job can run. Log in in the pro-cli Chrome, then run pro-cli auth capture --json." });
+    lasting.push(PAGE_LOGGED_OUT);
   } else if (page?.status === "unavailable") {
     lasting.push({ key: "page-unavailable", line: "The ChatGPT page could not be read over CDP (no chatgpt.com tab, or it did not answer)." });
   }
@@ -167,29 +180,67 @@ export async function runHealthCheck(config: LimitWatchConfig, paths: HealthPath
 
   if (problems.length > 0) {
     deps.log(`PROBLEMS: ${problems.map((problem) => problem.line).join(" | ")}`);
-    const subject = problems.length === 1 ? `pro-cli health: ${problems[0].line.split(":")[0]}` : `pro-cli health: ${problems.length} problems`;
-    const lines = [
-      ...problems.map((problem) => `- ${problem.line}`),
+    queueNotice(state, config, problems, [
       ...(lasting.length > fresh.length ? ["", "Still open from earlier notices:", ...lasting.filter((p) => !fresh.includes(p)).map((p) => `- ${p.line}`)] : []),
       "",
       `Since ${utc(since)}: ${facts.join("; ")}.`,
-    ];
-    if (config.mail.to) state.pendingMail = mailMessage(subject, lines, config);
-    if (config.ntfy.url) {
-      state.pendingNtfy = {
-        body: `pro-cli health: ${problems.map((problem) => problem.line).join(" ")}`,
-        headers: { Tags: "warning", ...(config.ntfy.title ? { Title: config.ntfy.title } : {}) },
-      };
-    }
+    ]);
   } else {
     deps.log(`ok: ${facts.join("; ")}${lasting.length > 0 ? `; still open: ${lasting.map((p) => p.key).join(", ")}` : ""}`);
   }
 
   if (deps.dryRun) {
-    if (state.pendingMail) deps.log(`DRY RUN would mail:\n${state.pendingMail}`);
-    if (state.pendingNtfy) deps.log(`DRY RUN would post to ntfy: ${state.pendingNtfy.body}`);
+    logDryRun(state, deps);
     return;
   }
+  await sendPending(state, config, deps);
+  await saveState(paths.state, state);
+}
+
+/**
+ * --page-only: announces a logged-out page, and drops the announcement once the page is logged in
+ * again, so a later logout is announced too. A page that cannot be read changes nothing. Notices an
+ * earlier run could not deliver go first; a new one waits until they are out. lastRunAt is left
+ * to the twice-daily runs, whose events cover the time since their own last run.
+ */
+async function checkPage(config: LimitWatchConfig, paths: HealthPaths, deps: HealthDeps, state: HealthState): Promise<void> {
+  const cdpUp = await deps.cdpUp().catch(() => false);
+  const page = cdpUp ? await deps.pageSession().catch((): PageSession => ({ status: "unavailable" })) : null;
+  const announced = new Set(state.announced ?? []);
+  if (page?.status === "present") announced.delete(PAGE_LOGGED_OUT_KEY);
+  if (!deps.dryRun) await sendPending(state, config, deps);
+  if (page?.status === "logged_out" && !announced.has(PAGE_LOGGED_OUT_KEY) && !state.pendingMail && !state.pendingNtfy) {
+    deps.log(`PROBLEMS (page check): ${PAGE_LOGGED_OUT.line}`);
+    queueNotice(state, config, [PAGE_LOGGED_OUT], ["", `Seen by the 10-minute page check at ${utc(deps.now().toISOString())}.`]);
+    announced.add(PAGE_LOGGED_OUT_KEY);
+    if (deps.dryRun) {
+      logDryRun(state, deps);
+      return;
+    }
+    await sendPending(state, config, deps);
+  }
+  if (deps.dryRun) return;
+  state.announced = [...announced];
+  await saveState(paths.state, state);
+}
+
+function queueNotice(state: HealthState, config: LimitWatchConfig, problems: Problem[], footer: string[]): void {
+  const subject = problems.length === 1 ? `pro-cli health: ${problems[0].line.split(":")[0]}` : `pro-cli health: ${problems.length} problems`;
+  if (config.mail.to) state.pendingMail = mailMessage(subject, [...problems.map((problem) => `- ${problem.line}`), ...footer], config);
+  if (config.ntfy.url) {
+    state.pendingNtfy = {
+      body: `pro-cli health: ${problems.map((problem) => problem.line).join(" ")}`,
+      headers: { Tags: "warning", ...(config.ntfy.title ? { Title: config.ntfy.title } : {}) },
+    };
+  }
+}
+
+function logDryRun(state: HealthState, deps: HealthDeps): void {
+  if (state.pendingMail) deps.log(`DRY RUN would mail:\n${state.pendingMail}`);
+  if (state.pendingNtfy) deps.log(`DRY RUN would post to ntfy: ${state.pendingNtfy.body}`);
+}
+
+async function sendPending(state: HealthState, config: LimitWatchConfig, deps: HealthDeps): Promise<void> {
   if (state.pendingMail) {
     if (await deps.sendMail(state.pendingMail)) {
       deps.log(`mailed ${config.mail.to}`);
@@ -202,7 +253,6 @@ export async function runHealthCheck(config: LimitWatchConfig, paths: HealthPath
       state.pendingNtfy = null;
     } else deps.log("ntfy post failed; will retry next run");
   }
-  await saveState(paths.state, state);
 }
 
 function checkToken(token: SessionTokenExport | null, page: PageSession | null, now: Date): Problem | null {
@@ -321,7 +371,8 @@ if (import.meta.main) {
       now: () => new Date(),
       log: (line) => console.log(`${new Date().toISOString()} ${line}`),
       dryRun: args.includes("--dry-run"),
-      timers: ["pro-cli-limit-watch.timer"],
+      pageOnly: args.includes("--page-only"),
+      timers: ["pro-cli-limit-watch.timer", "pro-cli-page-check.timer"],
       cdpUp: () => fetch(`${cdpBase}/json/version`, { signal: AbortSignal.timeout(5_000) }).then((response) => response.ok),
       // The same session read every job starts with; the token itself is never printed.
       pageSession: async () => {

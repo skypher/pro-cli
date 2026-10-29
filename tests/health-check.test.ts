@@ -57,11 +57,12 @@ async function writeToken(expiresAt: string, accountId = "acct_1") {
   await writeFile(paths.token, JSON.stringify({ version: 1, generatedAt: now.toISOString(), source: "pro-cli-cdp-page", accessToken: "header.payload.sig", accountId, expiresAt }));
 }
 
-async function check(dryRun = false) {
+async function check(dryRun = false, pageOnly = false) {
   const deps: HealthDeps = {
     now: () => now,
     log: (line) => sent.log.push(line),
     dryRun,
+    pageOnly,
     timers: ["pro-cli-limit-watch.timer"],
     cdpUp: async () => world.cdpUp,
     pageSession: async () => world.page,
@@ -248,6 +249,115 @@ describe("health check", () => {
     world.cdpUp = false;
     const before = await readFile(paths.state, "utf8");
     await check(true);
+    expect(sent.mail).toEqual([]);
+    expect(sent.ntfy).toEqual([]);
+    expect(sent.log.some((line) => line.startsWith("DRY RUN would mail"))).toBe(true);
+    expect(await readFile(paths.state, "utf8")).toBe(before);
+  });
+});
+
+describe("page check (--page-only)", () => {
+  const pageCheck = (dryRun = false) => check(dryRun, true);
+  const later = (minutes: number) => {
+    now = new Date(now.getTime() + minutes * 60_000);
+  };
+
+  test("announces a logged-out page at once, and the twice-daily run does not repeat it", async () => {
+    await endedJobs([{ code: "EMPTY_RESPONSE", hoursAgo: 2 }]);
+    world.page = { status: "logged_out" };
+    await pageCheck();
+    expect(subjects()).toEqual([`Subject: ${tag}pro-cli health: The ChatGPT page is logged out`]);
+    expect(sent.mail[0]).toContain("Seen by the 10-minute page check at");
+    expect(sent.mail[0]).not.toContain("jobs failed");
+    expect(sent.ntfy).toEqual([`pro-cli health: ${"The ChatGPT page is logged out: no job can run. Log in in the pro-cli Chrome, then run pro-cli auth capture --json."}`]);
+
+    later(10);
+    await pageCheck();
+    later(30);
+    await check();
+    // The twice-daily run still reports the jobs that failed since its own last run.
+    expect(sent.mail).toHaveLength(2);
+    expect(subjects()[1]).toBe(`Subject: ${tag}pro-cli health: 1 jobs failed`);
+    expect(sent.mail[1]).toContain("Still open from earlier notices:\n- The ChatGPT page is logged out");
+    expect(sent.ntfy).toHaveLength(2);
+  });
+
+  test("stays silent while the page is logged in or cannot be read, and announces a later logout again", async () => {
+    await pageCheck();
+    world.page = { status: "unavailable" };
+    later(10);
+    await pageCheck();
+    world.cdpUp = false;
+    later(10);
+    await pageCheck();
+    expect(sent.mail).toEqual([]);
+    expect(sent.log).toEqual([]);
+
+    world.cdpUp = true;
+    world.page = { status: "logged_out" };
+    later(10);
+    await pageCheck();
+    world.page = { status: "unavailable" };
+    later(10);
+    await pageCheck();
+    world.page = { status: "logged_out" };
+    later(10);
+    await pageCheck();
+    expect(sent.mail).toHaveLength(1);
+
+    world.page = { status: "present", expiresAt: at(7 * 24), accountId: "acct_1" };
+    later(10);
+    await pageCheck();
+    world.page = { status: "logged_out" };
+    later(10);
+    await pageCheck();
+    expect(sent.mail).toHaveLength(2);
+    expect(sent.ntfy).toHaveLength(2);
+  });
+
+  test("leaves the twice-daily run's starting point alone", async () => {
+    const before = JSON.parse(await readFile(paths.state, "utf8")).lastRunAt;
+    world.page = { status: "logged_out" };
+    await pageCheck();
+    expect(JSON.parse(await readFile(paths.state, "utf8"))).toMatchObject({ lastRunAt: before, announced: ["page-logged-out"] });
+  });
+
+  test("retries a notice it could not deliver on the next check, without announcing twice", async () => {
+    world.page = { status: "logged_out" };
+    world.mailOk = false;
+    await pageCheck();
+    world.mailOk = true;
+    later(10);
+    await pageCheck();
+    later(10);
+    await pageCheck();
+    expect(sent.mail).toHaveLength(2);
+    expect(sent.mail[1]).toBe(sent.mail[0]);
+    expect(sent.ntfy).toHaveLength(1);
+    expect(JSON.parse(await readFile(paths.state, "utf8"))).toMatchObject({ pendingMail: null, pendingNtfy: null });
+  });
+
+  test("sends an undelivered notice of the twice-daily run first, and only then its own", async () => {
+    world.cdpUp = false;
+    world.mailOk = false;
+    await check();
+    world.cdpUp = true;
+    world.page = { status: "logged_out" };
+    later(10);
+    await pageCheck();
+    world.mailOk = true;
+    later(10);
+    await pageCheck();
+    expect(sent.mail).toHaveLength(4);
+    expect(sent.mail[2]).toBe(sent.mail[0]);
+    expect(subjects()[3]).toBe(`Subject: ${tag}pro-cli health: The ChatGPT page is logged out`);
+    expect(sent.ntfy).toHaveLength(2);
+  });
+
+  test("a dry run sends and saves nothing", async () => {
+    world.page = { status: "logged_out" };
+    const before = await readFile(paths.state, "utf8");
+    await pageCheck(true);
     expect(sent.mail).toEqual([]);
     expect(sent.ntfy).toEqual([]);
     expect(sent.log.some((line) => line.startsWith("DRY RUN would mail"))).toBe(true);

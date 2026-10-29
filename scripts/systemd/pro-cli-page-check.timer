@@ -1,0 +1,9 @@
+[Unit]
+Description=Check every 10 minutes whether the pro-cli ChatGPT page is logged out
+
+[Timer]
+# Off the minute of the twice-daily health check (xx:23), so the two do not write the state at once.
+OnCalendar=*:05/10
+
+[Install]
+WantedBy=timers.target
