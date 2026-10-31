@@ -1558,6 +1558,7 @@ interface StreamSummary {
   sawStreamComplete: boolean;
   lastCounter: number | null;
   events: string[];
+  serverSteMetadata: Array<Record<string, string | number | boolean>>;
 }
 
 // Describes the stream's structure (event types, patch paths, message roles and
@@ -1572,6 +1573,7 @@ function summarizeConversationStream(raw: string): StreamSummary {
     sawStreamComplete: false,
     lastCounter: null,
     events: [],
+    serverSteMetadata: [],
   };
   let previous: string | null = null;
   let repeats = 0;
@@ -1593,6 +1595,9 @@ function summarizeConversationStream(raw: string): StreamSummary {
       if (event.type === "done") summary.sawDone = true;
       if (event.type === "message_stream_complete") summary.sawStreamComplete = true;
       if (typeof event.c === "number") summary.lastCounter = event.c;
+      if (event.type === "server_ste_metadata" && isRecord(event.metadata) && summary.serverSteMetadata.length < 4) {
+        summary.serverSteMetadata.push(serverSteFlags(event.metadata));
+      }
       summary.conversationId = extractConversationId(event) ?? summary.conversationId;
     }
     const description = `${eventName ? `[${eventName}] ` : ""}${describeStreamEvent(event)}`;
@@ -1612,12 +1617,58 @@ function summarizeConversationStream(raw: string): StreamSummary {
   return summary;
 }
 
+// String fields of server_ste_metadata that name a category rather than a request or
+// a person; ids, the user agent and unknown strings are dropped.
+const SERVER_STE_STRING_FIELDS = new Set([
+  "turn_mode",
+  "turn_use_case",
+  "product_experience",
+  "requested_model_experience",
+  "plan_type",
+  "plan_type_bucket",
+  "model_slug",
+  "service",
+  "region",
+  "cluster_region",
+  "warmup_state",
+  "auto_switcher_race_winner",
+  "tool_name",
+]);
+
+// The server's routing flags for the turn (pro_mode_turn_topic_streaming,
+// temporal_conversation_turn, resume_with_websockets, ...), which say how ChatGPT
+// meant the turn to be delivered.
+function serverSteFlags(metadata: Record<string, unknown>): Record<string, string | number | boolean> {
+  const flags: Record<string, string | number | boolean> = {};
+  for (const [key, value] of Object.entries(metadata)) {
+    if (typeof value === "boolean" || typeof value === "number") flags[key] = value;
+    else if (typeof value === "string" && SERVER_STE_STRING_FIELDS.has(key)) flags[key] = value.slice(0, 80);
+  }
+  return flags;
+}
+
+// A handoff option's type, plus the topic prefix of a WebSocket topic (the rest is an id).
+function describeHandoffOption(option: Record<string, unknown>): string {
+  const type = typeof option.type === "string" ? option.type : "unknown";
+  const prefix = typeof option.topic_id === "string"
+    ? /^(conversation-|conv-turn-low-ttl-)/.exec(option.topic_id)?.[1]
+    : undefined;
+  return prefix ? `${type}(${prefix})` : type;
+}
+
 function describeStreamEvent(event: unknown): string {
   if (event === undefined) return "unparsable";
   if (event === null) return "no-data";
   if (!isRecord(event)) return typeof event;
   const parts: string[] = [];
   if (typeof event.type === "string") parts.push(event.type);
+  if (event.type === "stream_handoff" && Array.isArray(event.options)) {
+    parts.push(`options=${event.options.filter(isRecord).map(describeHandoffOption).join(",") || "none"}`);
+  }
+  if (event.type === "conversation_async_status"
+    && (typeof event.async_status === "number" || typeof event.async_status === "string")) {
+    parts.push(`async_status=${event.async_status}`);
+  }
   if (typeof event.o === "string") parts.push(typeof event.p === "string" && event.p ? `${event.o} ${event.p}` : event.o);
   if (typeof event.type !== "string" && (event.error || event.error_code)) {
     parts.push(typeof event.error_code === "string" && event.error_code ? `error error_code=${event.error_code}` : "error");

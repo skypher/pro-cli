@@ -1764,6 +1764,43 @@ describe("ChatGPT transport: cut-off answer streams", () => {
     });
   });
 
+  test("records the server's routing flags and handoff options of a cut-off stream, without ids", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const diagnosticsDir = await mkdtemp(join(tmpdir(), "pro-stream-diag-"));
+      try {
+        const pageEvaluator = (async <T>(_base: string, script: string): Promise<T> => {
+          if (script.includes("fetchConversationAnswer")) {
+            return { ok: true, status: 200, state: "done", text: "Recovered answer", message: null } as T;
+          }
+          return {
+            ok: true,
+            status: 200,
+            body: cutOffStream("conv_flags", [
+              'data: {"type":"stream_handoff","conversation_id":"conv_flags","turn_exchange_id":"tx-1","options":[{"type":"resume_sse_endpoint"},{"type":"subscribe_ws_topic","topic_id":"conv-turn-low-ttl-topic-id-value"}]}',
+              'data: {"type":"conversation_async_status","conversation_id":"conv_flags","async_status":2}',
+              'data: {"type":"server_ste_metadata","conversation_id":"conv_flags","metadata":{"turn_mode":"pro","pro_mode_turn_topic_streaming":true,"resume_with_websockets":false,"low_turn_topic_ttl":600,"request_id":"request-id-value","user_agent":"user-agent-value","search_tool_query_types":["query-type-value"]}}',
+            ]),
+          } as T;
+        });
+
+        await runChatGptJob(job(), { sessionTokenPath, pageEvaluator, diagnosticsDir, streamRecoveryPollMs: 0 });
+
+        const diagnostics = await readFile(join(diagnosticsDir, "job_test-stream.json"), "utf8");
+        const record = JSON.parse(diagnostics);
+        expect(record.serverSteMetadata).toEqual([
+          { turn_mode: "pro", pro_mode_turn_topic_streaming: true, resume_with_websockets: false, low_turn_topic_ttl: 600 },
+        ]);
+        expect(record.events).toContain("stream_handoff options=resume_sse_endpoint,subscribe_ws_topic(conv-turn-low-ttl-)");
+        expect(record.events).toContain("conversation_async_status async_status=2");
+        for (const value of ["topic-id-value", "request-id-value", "user-agent-value", "query-type-value", "tx-1"]) {
+          expect(diagnostics).not.toContain(value);
+        }
+      } finally {
+        await rm(diagnosticsDir, { recursive: true, force: true });
+      }
+    });
+  });
+
   test("does not accept partial answer text from a stream that was cut off", async () => {
     await withTokenFile(async (sessionTokenPath) => {
       const pageEvaluator = (async <T>(_base: string, script: string): Promise<T> => {
