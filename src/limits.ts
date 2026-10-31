@@ -107,6 +107,103 @@ function shouldRecoverCookieBloat(raw: RawFetchResult): boolean {
   return raw.status === 431 || raw.body.includes("chrome-error://chromewebdata/");
 }
 
+export interface ModelLimit {
+  model: string;
+  resetsAfter: string;
+  /** ChatGPT's wording, e.g. "Capabilities reduced until November 3. Responses may have lower quality." */
+  description: string | null;
+}
+
+/**
+ * The page script that asks conversation/init which models have reached their usage limit, as
+ * the ChatGPT page does before every new chat. It sends no prompt and spends no quota.
+ */
+export function buildModelLimitsExpression(): string {
+  const requestBody = { requested_default_model: null };
+  return `(${async function conversationInit(requestBody: Record<string, unknown>): Promise<RawFetchResult> {
+    if (location.origin !== "https://chatgpt.com") {
+      return { ok: false, status: 0, code: "CHATGPT_PAGE_MISSING", body: location.href };
+    }
+    const sessionResponse = await fetch("https://chatgpt.com/api/auth/session", { credentials: "include", referrerPolicy: "no-referrer" });
+    const session = (await sessionResponse.json().catch(() => null)) as { accessToken?: unknown } | null;
+    if (typeof session?.accessToken !== "string" || !session.accessToken) {
+      return { ok: false, status: sessionResponse.status, code: "CHATGPT_PAGE_LOGGED_OUT", body: "" };
+    }
+    const response = await fetch("https://chatgpt.com/backend-api/conversation/init", {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        authorization: `Bearer ${session.accessToken}`,
+        accept: "application/json",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        ...requestBody,
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        timezone_offset_min: new Date().getTimezoneOffset(),
+      }),
+    });
+    return { ok: response.ok, status: response.status, body: await response.text() };
+  }})(${JSON.stringify(requestBody)})`;
+}
+
+/**
+ * Page code that a request's page script runs before it sends anything: asks conversation/init
+ * about the request, as the ChatGPT page does before a new chat, and returns its answer when it
+ * lists `model` as limited until a time still ahead. Null otherwise, also when the answer can't be
+ * read, so a failed check never stops a request. It runs in the page, so it uses nothing from here.
+ */
+export async function pageModelLimitBody(
+  model: string,
+  request: Record<string, unknown>,
+  accessToken: string,
+): Promise<string | null> {
+  try {
+    const response = await fetch("https://chatgpt.com/backend-api/conversation/init", {
+      method: "POST",
+      credentials: "include",
+      headers: { authorization: `Bearer ${accessToken}`, accept: "application/json", "content-type": "application/json" },
+      body: JSON.stringify(request),
+    });
+    if (!response.ok) return null;
+    const body = await response.text();
+    const limits = (JSON.parse(body) as { model_limits?: unknown } | null)?.model_limits;
+    const listed = Array.isArray(limits) && limits.some((entry: { model_slug?: unknown; resets_after?: unknown } | null) =>
+      entry?.model_slug === model && Date.parse(String(entry.resets_after)) > Date.now());
+    return listed ? body : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The models a conversation/init response lists as limited whose reset is still ahead. */
+export function readModelLimits(body: unknown, now = Date.now()): ModelLimit[] {
+  if (!isRecord(body) || !Array.isArray(body.model_limits)) return [];
+  const banner = isRecord(body.banner_info) ? body.banner_info : null;
+  const blocked = Array.isArray(body.blocked_features) ? body.blocked_features.filter(isRecord) : [];
+  return body.model_limits.filter(isRecord).flatMap((entry) => {
+    const model = stringOrNull(entry.model_slug);
+    const resetsAt = Date.parse(stringOrNull(entry.resets_after) ?? "");
+    if (!model || !(resetsAt > now)) return [];
+    const description = stringOrNull(entry.description)
+      ?? (banner?.name === model ? stringOrNull(banner.description) : null)
+      ?? stringOrNull(blocked.find((feature) => Date.parse(String(feature.resets_after)) === resetsAt)?.description);
+    return [{ model, resetsAfter: new Date(resetsAt).toISOString(), description }];
+  });
+}
+
+/** The models whose usage limit is reached; null when the page could not be asked. */
+export async function fetchModelLimits(cdpBase?: string): Promise<ModelLimit[] | null> {
+  const raw = await evaluateInCdpPage<RawFetchResult>(cdpBase ?? DEFAULT_CDP_BASE, buildModelLimitsExpression(), 30_000)
+    .catch(() => null);
+  if (!raw?.ok) return null;
+  try {
+    return readModelLimits(JSON.parse(raw.body));
+  } catch {
+    return null;
+  }
+}
+
 export function summarizeAccountResponse(body: string): AccountSummary {
   let parsed: unknown;
   try {

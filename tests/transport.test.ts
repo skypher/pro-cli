@@ -1721,6 +1721,66 @@ describe("ChatGPT transport: stored session token refresh", () => {
   });
 });
 
+describe("ChatGPT transport: model usage limits", () => {
+  const resetsAfter = new Date(Date.now() + 3 * 24 * 60 * 60_000).toISOString();
+  const reduced = "Capabilities reduced until November 3. Responses may have lower quality.";
+  // A conversation/init answer for an account whose limit on `model` resets at `resets`.
+  const initBody = (model: string, resets = resetsAfter) => JSON.stringify({
+    type: "conversation_detail_metadata",
+    banner_info: { name: model, resets_after: resets, description: reduced },
+    blocked_features: [{ name: "reason", resets_after: resets, limit: 200, description: reduced }],
+    model_limits: [{ model_slug: model, using_default_model_slug: model, resets_after: resets, description: null }],
+    limits_progress: [],
+    default_model_slug: "gpt-5-5-thinking",
+  });
+
+  test("the page script checks a chat model's limit before it sends anything", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      let expression = "";
+      const pageEvaluator = (async <T>(_base: string, script: string): Promise<T> => {
+        expression = script;
+        return { ok: true, status: 200, body: conversationStream("OK") } as T;
+      });
+
+      expect(await runChatGptJob(job(), { sessionTokenPath, pageEvaluator })).toBe("OK");
+      expect(expression).toContain("async function pageModelLimitBody");
+      expect(expression.indexOf("modelLimitBody(requestBody.model")).toBeLessThan(expression.indexOf("/f/conversation/prepare\", {"));
+    });
+  });
+
+  test("a job on a model whose usage limit is reached fails with the limit's reset time", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      let evaluations = 0;
+      const pageEvaluator = (async <T>(): Promise<T> => {
+        evaluations += 1;
+        return { ok: false, status: 200, code: "CHATGPT_MODEL_LIMITED", body: initBody("gpt-5-5-pro") } as T;
+      });
+
+      const error = await runChatGptJob(job(), { sessionTokenPath, pageEvaluator, retries: 2 }).catch((caught) => caught);
+
+      expect(error).toBeInstanceOf(ProError);
+      expect(error.toPayload()).toMatchObject({
+        code: "UPSTREAM_ERROR",
+        details: { errorCode: "usage_limit", model: "gpt-5-5-pro", resetsAfter, limitDescription: reduced },
+      });
+      expect(error.message).toBe(`ChatGPT's usage limit for gpt-5-5-pro is reached until ${resetsAfter}; nothing was sent.`);
+      expect(evaluations).toBe(1);
+    });
+  });
+
+  test("a limited model is still refused when the limit's details cannot be read", async () => {
+    await withTokenFile(async (sessionTokenPath) => {
+      const pageEvaluator = (async <T>(): Promise<T> =>
+        ({ ok: false, status: 200, code: "CHATGPT_MODEL_LIMITED", body: "<html>" }) as T);
+
+      const error = await runChatGptJob(job(), { sessionTokenPath, pageEvaluator }).catch((caught) => caught);
+
+      expect(error.toPayload()).toMatchObject({ code: "UPSTREAM_ERROR", details: { errorCode: "usage_limit", model: "gpt-5-5-pro" } });
+      expect(error.details).not.toHaveProperty("resetsAfter");
+    });
+  });
+});
+
 describe("ChatGPT transport: cut-off answer streams", () => {
   test("polls the conversation for the answer when the stream ends before the answer", async () => {
     await withTokenFile(async (sessionTokenPath) => {
@@ -2058,12 +2118,12 @@ describe("ChatGPT transport: cut-off answer streams", () => {
 
       await runChatGptJob(job(), { sessionTokenPath, pageEvaluator });
       expect(evaluateTimeoutMs).toBe(30 * 60_000);
-      // The last argument is the key the page publishes the chat id under.
-      expect(expression).toMatch(/, "acct_test", 1680000, "[0-9a-f]{8}-[0-9a-f-]{27}"\)$/);
+      // After the stream budget comes the key the page publishes the chat id under, then the model-limit check.
+      expect(expression).toMatch(/, "acct_test", 1680000, "[0-9a-f]{8}-[0-9a-f-]{27}", async function pageModelLimitBody\(/);
 
       await runChatGptJob(job(), { sessionTokenPath, pageEvaluator, timeoutMs: 60_000 });
       expect(evaluateTimeoutMs).toBe(60_000);
-      expect(expression).toMatch(/, "acct_test", 48000, "[0-9a-f]{8}-[0-9a-f-]{27}"\)$/);
+      expect(expression).toMatch(/, "acct_test", 48000, "[0-9a-f]{8}-[0-9a-f-]{27}", async function pageModelLimitBody\(/);
     });
   });
 });

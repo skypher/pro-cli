@@ -9,6 +9,7 @@ import { DEFAULT_MODEL, isReasoningLevel } from "./defaults";
 import { decodeDeltaStream, DeltaStreamDecoder, type DecodedMessage } from "./delta-stream";
 import { EXIT, ProError } from "./errors";
 import type { JobRecord, KeptConversationReason, LimitsObservation } from "./jobs";
+import { pageModelLimitBody, readModelLimits, type ModelLimit } from "./limits";
 import { canonicalModelId, modelUsesThinkingEffort } from "./models";
 import {
   isTokenFresh,
@@ -184,6 +185,36 @@ export async function runChatGptResearchTask(task: ResearchTask, options: Transp
   });
 }
 
+// ChatGPT keeps taking a chat model's requests once its usage limit is reached, with "capabilities
+// reduced": a turn that needs to think stops partway and never answers, and the job would poll its
+// chat for hours. The page script asks conversation/init first and sends nothing when it lists the
+// model (pageModelLimitBody); the job then fails with the same usage_limit code as a refused turn.
+function modelLimitError(model: string, initBody: string): ProError {
+  let limit: ModelLimit | undefined;
+  try {
+    limit = readModelLimits(JSON.parse(initBody)).find((entry) => entry.model === model);
+  } catch {
+    limit = undefined;
+  }
+  return new ProError(
+    "UPSTREAM_ERROR",
+    `ChatGPT's usage limit for ${model} is reached${limit ? ` until ${limit.resetsAfter}` : ""}; nothing was sent.`,
+    {
+      exitCode: EXIT.upstream,
+      suggestions: [
+        `Send the request again ${limit ? `after ${limit.resetsAfter}` : "later"}, or with another model.`,
+        "pro-cli limits --json shows model limits without sending a request.",
+      ],
+      details: {
+        errorCode: "usage_limit",
+        model,
+        ...(limit ? { resetsAfter: limit.resetsAfter } : {}),
+        ...(limit?.description ? { limitDescription: limit.description } : {}),
+      },
+    },
+  );
+}
+
 // Requests carry the page's own access token; the stored copy gives the account id and shows a
 // login was captured with auth capture. Once that copy has less than this left, the page's current
 // token for the same account is used instead, and saved when it lasts longer, so nobody has to
@@ -277,7 +308,13 @@ async function postChatGptJob(
       try {
         return await evaluate<BrowserFetchResult>(
           cdpBase,
-          buildBrowserFetchExpression(buildRequestBody(job, attachments), session.accountId, streamBudgetMs, watchKey),
+          buildBrowserFetchExpression(
+            buildRequestBody(job, attachments),
+            session.accountId,
+            streamBudgetMs,
+            watchKey,
+            canonicalModelId(job.model) !== "image" && canonicalModelId(job.model) !== "research",
+          ),
           browserTimeoutMs,
         );
       } finally {
@@ -337,6 +374,8 @@ async function postChatGptJob(
         },
       );
     }
+
+    if (browserResult.code === "CHATGPT_MODEL_LIMITED") throw modelLimitError(normalizeModel(job.model), browserResult.body);
 
     // ChatGPT's abuse check answers with a 403 instead of a stream:
     // {"detail":"Unusual activity has been detected from your device. Try again later. (<id>)"}.
@@ -491,7 +530,7 @@ interface BrowserFetchResult {
   ok: boolean;
   status: number;
   body: string;
-  code?: "CHATGPT_PAGE_MISSING" | "CHATGPT_PAGE_LOGGED_OUT" | "CHATGPT_PROBE_FAILED";
+  code?: "CHATGPT_PAGE_MISSING" | "CHATGPT_PAGE_LOGGED_OUT" | "CHATGPT_PROBE_FAILED" | "CHATGPT_MODEL_LIMITED";
 }
 
 function buildBrowserFetchExpression(
@@ -499,6 +538,7 @@ function buildBrowserFetchExpression(
   accountId: string,
   streamBudgetMs: number,
   watchKey = "",
+  checkModelLimit = false,
 ): string {
   return `(${async function browserFetch(
     endpoint: string,
@@ -506,6 +546,7 @@ function buildBrowserFetchExpression(
     account: string,
     streamBudget: number,
     conversationKey: string,
+    modelLimitBody: typeof pageModelLimitBody | null,
   ): Promise<BrowserFetchResult> {
     const streamDeadline = Date.now() + streamBudget;
     if (location.origin !== "https://chatgpt.com") {
@@ -540,6 +581,15 @@ function buildBrowserFetchExpression(
     const turnTraceId = crypto.randomUUID();
     const requestBody = withBrowserContext(body);
     const referrer = chatReferrer(requestBody);
+    if (modelLimitBody && typeof requestBody.model === "string") {
+      const limitBody = await modelLimitBody(requestBody.model, {
+        requested_default_model: requestBody.model,
+        ...(requestBody.history_and_training_disabled === true ? { history_and_training_disabled: true } : {}),
+        timezone: requestBody.timezone,
+        timezone_offset_min: requestBody.timezone_offset_min,
+      }, accessToken);
+      if (limitBody !== null) return { ok: false, status: 200, code: "CHATGPT_MODEL_LIMITED", body: limitBody };
+    }
     const prepareBody = buildPrepareBody(requestBody);
     const prepareResponse = await fetch("https://chatgpt.com/backend-api/f/conversation/prepare", {
       method: "POST",
@@ -1230,7 +1280,7 @@ function buildBrowserFetchExpression(
       hash ^= hash >>> 16;
       return (hash >>> 0).toString(16).padStart(8, "0");
     }
-  }})(${JSON.stringify(CHATGPT_CONVERSATION_ENDPOINT)}, ${JSON.stringify(requestBody)}, ${JSON.stringify(accountId)}, ${JSON.stringify(streamBudgetMs)}, ${JSON.stringify(watchKey)})`;
+  }})(${JSON.stringify(CHATGPT_CONVERSATION_ENDPOINT)}, ${JSON.stringify(requestBody)}, ${JSON.stringify(accountId)}, ${JSON.stringify(streamBudgetMs)}, ${JSON.stringify(watchKey)}, ${checkModelLimit ? String(pageModelLimitBody) : "null"})`;
 }
 
 interface PreparedChatRequirements {

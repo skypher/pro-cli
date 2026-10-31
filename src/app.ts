@@ -36,7 +36,7 @@ import { DEFAULT_MODEL, DEFAULT_REASONING, REASONING_LEVELS, isReasoningLevel } 
 import { EXIT, ProError, toProError } from "./errors";
 import { buildEphemeralJob, executeEphemeralJob } from "./executor";
 import { JobStore, redactJob } from "./jobs";
-import { fetchAccountSummary } from "./limits";
+import { fetchAccountSummary, fetchModelLimits } from "./limits";
 import {
   canonicalModelId,
   isProModel,
@@ -164,17 +164,19 @@ export async function runCli(argv: string[], io: CliIO): Promise<number> {
         const port = flagString(parsed.flags, "port");
         const cdpBase = cdp || port ? defaultCdpBase(port, cdp) : undefined;
         const account = await fetchAccountSummary(cdpBase);
+        const modelLimits = await fetchModelLimits(cdpBase);
         const store = await JobStore.open(paths.dbPath);
         try {
           const observed = store.latestLimits();
           writeSuccess(io, mode, {
             account,
+            modelLimits,
             usageLimit: store.usageLimitStatus(),
             observedLimits: observed,
             note:
               observed.length === 0
                 ? "No limits observed yet. Make a pro-cli ask/odds/job call; per-feature counters arrive in the stream metadata."
-                : "Per-feature counters captured from the most recent stream that included them. Pro chat throttling is adaptive and not exposed here.",
+                : "Per-feature counters captured from the most recent stream that included them. modelLimits is read live from conversation/init.",
           });
           return EXIT.success;
         } finally {

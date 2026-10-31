@@ -259,16 +259,19 @@ pro-cli limits --json
 Returns:
 
 - Plan facts from `accounts/check`: `plan_type`, `subscription_plan`, `expires_at`, `renews_at`, `billing_period`, `features`.
+- `modelLimits`: the models whose usage limit is reached right now, each with `model`, `resetsAfter` and ChatGPT's `description` (e.g. "Capabilities reduced until November 3. Responses may have lower quality."), read from `conversation/init` without sending a request. `null` when the page could not be asked.
 - Per-feature counters (e.g. `deep_research`, `odyssey`) captured from the ChatGPT stream metadata of recent `ask`/`odds`/`job` calls, with `observed_at` timestamps.
 - `usageLimit`: whether the account's usage limit is still in effect, read from the job history (see [Usage-limit watch](#usage-limit-watch)). `limited` is true while the latest `usage_limit` refusal has no later success on the same model. `model` is the refused model, `since` the first refusal of that limit, `lastRefusedAt` the last time a request found it in effect, and `liftedAt` when a job on that model, created after the latest refusal, succeeded. When no request was ever refused, `limited` is false and the rest are `null`. Through the SSH gate, `requestsPausedUntil` says until when the gate refuses new requests (`null` when it lets them through).
 
-ChatGPT does not expose a standalone limits endpoint, so counters refresh whenever you make a real Pro call. General Pro chat throttling is adaptive and not exposed by any endpoint we found.
+The per-feature counters refresh whenever you make a real Pro call. Model limits come from `conversation/init`, the call the ChatGPT page makes before every new chat.
 
 ChatGPT's abuse check can also refuse a single request with HTTP 403 ("Unusual activity has been detected from your device. Try again later."). pro-cli reports that as `CHATGPT_UNUSUAL_ACTIVITY` and does not retry it; send the request again after several minutes. Other refusals stay `UPSTREAM_REJECTED`.
 
 ### Usage-limit watch
 
 When the account's usage limit is reached, ChatGPT refuses every request with `UPSTREAM_ERROR` and `details.errorCode: usage_limit` ("You've hit your limit. Please try again later."), and it gives no reset time.
+
+ChatGPT also has a softer model limit: after heavy use it keeps taking a model's requests, but with "capabilities reduced" until a set time. A turn that needs to think then stops partway and never answers, and shorter answers come back weaker. The ChatGPT page greys the model out ("Limit reached. Try again after …"). pro-cli checks for this before every chat request: when `conversation/init` lists the job's model, the job fails at once with `UPSTREAM_ERROR`, `details.errorCode: usage_limit`, `details.resetsAfter` and ChatGPT's wording in `details.limitDescription`, and nothing is sent. Image and Deep Research jobs are not checked. If the check itself fails, the request goes ahead.
 
 `scripts/pro-cli-limit-watch.ts` notices the limit and probes until it lifts:
 - **Probes:** it sends one probe an hour ("Reply with OK only.", temporary chat, the same model and effort as the refused job). ChatGPT refuses each probe at once while the limit lasts; the probe that finds the limit lifted costs one small request.
@@ -291,7 +294,7 @@ The config fields:
 - `gateKeys` lists SSH gate keys whose failed jobs the "lifted" email counts.
 - `probeEveryMinutes` sets the probe interval (0 turns probing off); `probePrompt` sets the probe text.
 
-The watch logs one line per event to `~/.local/state/pro-cli-limit-watch/watch.log` and never reads prompt or answer text. After a refusal, the SSH gate also refuses new requests for 30 minutes (`USAGE_LIMIT_PAUSED`). `pro-cli limits --json` shows whether a limit is still in effect without sending a request; while one lasts, its `lastRefusedAt` is at most about an hour old when the watch runs.
+The watch logs one line per event to `~/.local/state/pro-cli-limit-watch/watch.log` and never reads prompt or answer text. After a refusal, the SSH gate also refuses new requests for 30 minutes (`USAGE_LIMIT_PAUSED`); when the refusal came with a reset time, its message and details name it (`model`, `resetsAfter`). `pro-cli limits --json` shows whether a limit is still in effect without sending a request; while one lasts, its `lastRefusedAt` is at most about an hour old when the watch runs.
 
 ### Health check
 

@@ -504,27 +504,38 @@ async function putFile(cfg: GateConfig, name: string, io: GateIO): Promise<Recor
 /**
  * The pause after the account's latest usage-limit refusal, if it still runs. A job on the refused
  * model, created after that refusal, that succeeds ends it early; a cheaper model working says
- * nothing about a Pro limit. A missing or unreadable database never pauses requests.
+ * nothing about a Pro limit. A missing or unreadable database never pauses requests. resetsAfter is
+ * the limit's own reset time, when ChatGPT gave one (pro-cli's model-limit check records it).
  */
-export function usageLimitPause(cfg: GateConfig, now = Date.now()): { refusedAt: string; retryAfter: string } | null {
+export function usageLimitPause(
+  cfg: GateConfig,
+  now = Date.now(),
+): { refusedAt: string; retryAfter: string; model: string; resetsAfter?: string } | null {
   if (!cfg.jobsDb) return null;
   let db: Database | null = null;
   try {
     db = new Database(cfg.jobsDb, { readonly: true });
     const refused = db
       .query(
-        `SELECT updated_at AS at, model FROM jobs
+        `SELECT updated_at AS at, model, json_extract(error_json, '$.details.resetsAfter') AS resetsAfter FROM jobs
          WHERE status = 'failed' AND json_extract(error_json, '$.details.errorCode') = 'usage_limit'
          ORDER BY updated_at DESC LIMIT 1`,
       )
-      .get() as { at: string; model: string } | null;
+      .get() as { at: string; model: string; resetsAfter: unknown } | null;
     if (!refused) return null;
     const succeeded = db
       .query("SELECT COUNT(*) AS n FROM jobs WHERE status = 'succeeded' AND model = ? AND created_at > ?")
       .get(refused.model, refused.at) as { n: number };
     if (succeeded.n > 0) return null;
     const retryAt = Date.parse(refused.at) + (cfg.usageLimitPauseMs ?? USAGE_LIMIT_PAUSE_MS);
-    return retryAt > now ? { refusedAt: refused.at, retryAfter: new Date(retryAt).toISOString() } : null;
+    if (retryAt <= now) return null;
+    const resetsAt = typeof refused.resetsAfter === "string" ? Date.parse(refused.resetsAfter) : NaN;
+    return {
+      refusedAt: refused.at,
+      retryAfter: new Date(retryAt).toISOString(),
+      model: refused.model,
+      ...(resetsAt > now ? { resetsAfter: new Date(resetsAt).toISOString() } : {}),
+    };
   } catch {
     return null;
   } finally {
@@ -545,8 +556,12 @@ async function runProCli(
     if (pause) {
       throw new GateError(
         "USAGE_LIMIT_PAUSED",
-        `ChatGPT refused this account's last request at ${pause.refusedAt} because its usage limit is reached ` +
-          `("You've hit your limit"). New requests are paused until ${pause.retryAfter}; nothing was sent. Retry after that.`,
+        pause.resetsAfter
+          ? `ChatGPT's usage limit for ${pause.model} is reached until ${pause.resetsAfter} (last found at ${pause.refusedAt}). ` +
+            `New requests are paused until ${pause.retryAfter}; nothing was sent. Requests on ${pause.model} fail ` +
+            `until ${pause.resetsAfter}.`
+          : `ChatGPT refused this account's last request at ${pause.refusedAt} because its usage limit is reached ` +
+            `("You've hit your limit"). New requests are paused until ${pause.retryAfter}; nothing was sent. Retry after that.`,
         4,
         pause,
       );

@@ -475,7 +475,14 @@ test("audit log records error codes of failed calls, not messages", async () => 
 describe("usage-limit pause", () => {
   // A job database whose jobs failed or succeeded at the given times (ISO strings).
   async function jobsDb(
-    jobs: Array<{ status: "failed" | "succeeded"; errorCode?: string; createdAt: string; updatedAt: string; model?: string }>,
+    jobs: Array<{
+      status: "failed" | "succeeded";
+      errorCode?: string;
+      resetsAfter?: string;
+      createdAt: string;
+      updatedAt: string;
+      model?: string;
+    }>,
   ) {
     const path = join(root, "jobs.sqlite");
     const store = await JobStore.open(path);
@@ -485,7 +492,9 @@ describe("usage-limit pause", () => {
         const { id } = store.create({ prompt: "question", model: entry.model ?? "gpt-5-5-pro", reasoning: "standard", options: {} });
         store.markRunning(id);
         if (entry.status === "failed") {
-          store.markFailed(id, new ProError("UPSTREAM_ERROR", "You've hit your limit.", { details: { errorCode: entry.errorCode ?? null } }));
+          store.markFailed(id, new ProError("UPSTREAM_ERROR", "You've hit your limit.", {
+            details: { errorCode: entry.errorCode ?? null, ...(entry.resetsAfter ? { resetsAfter: entry.resetsAfter } : {}) },
+          }));
         } else {
           store.markSucceeded(id, "answer");
         }
@@ -519,6 +528,19 @@ describe("usage-limit pause", () => {
     expect(calls).toHaveLength(0);
     const audit = (await readFile(join(root, "state", "tester", "audit.log"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
     expect(audit[0]).toMatchObject({ verb: "pro-cli job create", code: 4, error: "USAGE_LIMIT_PAUSED" });
+  });
+
+  test("names the limit's reset time when the refusal carries one", async () => {
+    const resetsAfter = new Date(Date.now() + 3 * 24 * 60 * 60_000).toISOString();
+    await jobsDb([{ status: "failed", errorCode: "usage_limit", resetsAfter, createdAt: ago(6), updatedAt: ago(5) }]);
+
+    const result = await gate("pro-cli job create --json hello");
+    expect(result.error).toBe("USAGE_LIMIT_PAUSED");
+    const error = (JSON.parse(result.stderr.split("\n")[0]) as { error: { message: string; details: Record<string, string> } }).error;
+    expect(error.details).toMatchObject({ model: "gpt-5-5-pro", resetsAfter });
+    expect(error.message).toContain(`usage limit for gpt-5-5-pro is reached until ${resetsAfter}`);
+    expect(Date.parse(error.details.retryAfter) - Date.parse(error.details.refusedAt)).toBe(30 * 60_000);
+    expect(calls).toHaveLength(0);
   });
 
   test("still answers job status, wait and result during the pause", async () => {
